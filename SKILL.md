@@ -1,67 +1,56 @@
 ---
 name: oa-pdf-download
-version: 1.2.0
-author: JL666788
-description: >-
-  Batch-download legally open-access (OA) academic full-text PDFs from a DOI list
-  or literature Excel/CSV, then honestly report unobtained papers and reasons.
-  Triggers on requests like: 下载全文 / 下载PDF / 获取原文 / 下载文献 / "download OA full texts" /
-  batch fetch papers. Features built-in PMC Hashcash proof-of-work solver, Springer/
-  Frontiers/MDPI/J-Stage direct pattern routing, Semantic Scholar probing, anti-bot
-  pacing, and China network DNS-pollution mitigations.
-tags:
-  - academic-research
-  - literature
-  - pdf-download
-  - open-access
-  - crossref
-  - pubmed-pmc
+display_name: OA论文全文下载
+display_name_en: OA PDF Downloader
+description: 批量合法下载开放获取(Open Access)学术论文PDF全文。当用户需要下载文献、下载论文、下载全文、下载PDF、获取原文、批量下载PDF或查询论文是否有公开OA版本时触发。
+description_zh: 批量合法下载开放获取(Open Access)学术论文PDF全文，内置PMC PoW挑战求解器，支持主流学术出版商直链与断点续传。
+description_en: Batch-download legally open-access (OA) academic full-text PDFs with built-in PMC Hashcash PoW solver and anti-bot pacing.
+version: 1.0.0
+author: "JL666788"
+allowed-tools: bash
+examples_zh:
+  - "帮我把这篇文献的OA全文下载下来：10.1186/s12917-020-02422-9"
+  - "把 records.csv 表格里的论文PDF都下载到 PDFs 目录，并统计哪些需要购买"
+  - "下载这些 DOI 的开放获取论文并生成 manifest 清单"
+examples_en:
+  - "Download OA PDF for DOI: 10.1186/s12917-020-02422-9"
+  - "Batch download open-access PDFs from records.csv into PDFs directory"
+  - "Fetch all available full texts for this DOI list and output manifest"
 ---
 
-# 📚 OA PDF Download: Academic Harvester Skill
+# OA 论文全文下载技能指令
 
-Automate the batch acquisition of **legally open-access** academic PDF full texts for a given list of research papers, ensuring 100% legal compliance, resilient anti-scraping countermeasures, and transparent reporting.
+本技能用于合规、批量下载学术论文中**合法开放获取（Open Access）**的 PDF 全文。每一条技术路线均经过真实科研环境实测验证，在保证 100% 版权合规的前提下，最大化全文获取成功率。
 
-Field-tested and verified in October 2026 (51/74 veterinary-coronavirus papers fetched in a single session).
+相关详细参考规范：
+- 出版商直链解析规则参见：@references/publisher-routes.md
+- PMC PoW 算法与反爬对抗纪律参见：@references/anti-bot-and-network.md
 
 ---
 
-## ⚖️ Golden Rule & Ethical Boundary
+## 核心执行原则与合规红线
 
 > [!IMPORTANT]
-> **Strict Legal Open-Access Only**:
-> - Only fetch from legitimate OA channels (Publisher OA portals, PubMed Central, Europe PMC, institutional open repositories via Semantic Scholar).
-> - **Never attempt paywall circumvention, never query Sci-Hub, and never use unauthorized cookies.**
-> - The PMC Proof-of-Work cookie solved in Phase B is an anti-scraping rate-limiting challenge, not an access control wall (it mirrors standard browser execution).
-> - If a paper is purely paywalled with no legal OA copy, **report it transparently** so the user can acquire it via university/institutional library access.
+> 1. **仅限合法 OA 渠道**：仅调用官方开放获取端点（PMC、Europe PMC、出版商公开直链、机构知识库公开副本）。
+> 2. **绝不越权**：不绕过付费墙，不连接 Sci-Hub，不伪造任何未授权账号凭据。
+> 3. **真实客观报告**：商业付费且无公开存证的文献，必须如实向用户标记为“商业数据库付费墙”，方便用户通过高校图书馆或校园网 WebVPN 获取。
 
 ---
 
-## 🎯 When to Activate This Skill
+## 执行步骤与操作指引
 
-Activate this skill whenever the user asks to:
-- 下载全文 / 下载文献 / 下载PDF / 获取论文原文 / 批量下载论文
-- "Download the PDFs for these papers" / "Fetch all available full texts"
-- "Which of these papers are open access?"
-- Mid-workflow handoff after a literature search or systematic review CSV deliverable.
+当用户要求下载论文或提供 DOI 列表时，按以下标准化流程执行：
 
----
+### 1. 规范化输入数据
+- 检查用户提供的输入文件（支持 CSV 或 TXT）。
+- 若为 CSV，需包含 `DOI` 列，可选包含 `文献名`（或 `title`）、`年份`（或 `year`）列用于生成清晰规范的文件名。
+- 若为纯文本，每行一个 DOI 即可。
 
-## 🛠️ Standard Operating Procedure (SOP)
-
-When assigned to fetch PDFs, do **not** write a custom ad-hoc downloader from scratch. Execute the battle-tested bundled script:
-
-### Step 1: Normalize Input
-Check user input. It may be:
-- A CSV or Excel file containing a `DOI` column (optional `文献名`/`title`, `年份`/`year` columns).
-- A raw list of DOIs in text format.
-*(If given an Excel file `.xlsx`, convert it to `.csv` or pass the DOIs).*
-
-### Step 2: Background Script Execution
-Since downloading dozens of papers with PMC anti-bot pacing can take 10–40 minutes, **always run the script as a background process** (`run_command` with async / background support):
+### 2. 调度执行脚本
+通过 Bash 工具在后台调度执行随包脚本 `scripts/fetch_oa_pdfs.py`，避免阻塞主会话：
 
 ```bash
-python "<skill-dir>/scripts/fetch_oa_pdfs.py" \
+python scripts/fetch_oa_pdfs.py \
     --input "records.csv" \
     --outdir "PDFs" \
     --state "state.json" \
@@ -69,88 +58,44 @@ python "<skill-dir>/scripts/fetch_oa_pdfs.py" \
     --deadline-min 45
 ```
 
-- **`--state state.json`**: Transactional state persistence. The script saves progress after **every single successful download**. If interrupted, relaunching immediately resumes without repeating finished items.
-- **`--email <email>`**: Provides access to Crossref's polite pool for faster, higher-rate metadata resolution.
+- **`--state state.json`**：事务级断点保护，每下载成功一篇立即写入磁盘。即便脚本被中断或超时终止，重新启动亦可无缝跳过已完成项。
+- **`--email`**：传入真实邮箱可进入 Crossref API 的 "Polite Pool"，获取更快更稳定的元数据响应。
 
-### Step 3: Monitor & Defend Against Rate Limits
-- Periodically verify background task output.
-- The pipeline automatically navigates two phases:
-  1. **Phase A (Fast, ~0.5–1s)**: Publisher direct patterns + Europe PMC + Semantic Scholar probe.
-  2. **Phase B (Paced, 15–30s)**: Multi-round PMC downloads with Hashcash PoW solving and 90s+ reCAPTCHA cooldowns.
+### 3. 两阶段下载调度机制
+脚本内部自动流转执行两阶段管道：
+- **Phase A (快筛阶段)**：秒级扫描 Springer、BMC、Frontiers、MDPI、J-Stage 直链及 Semantic Scholar 预印本源。
+- **Phase B (精细阶段)**：针对具备 PMCID 的文献，启动带 Hashcash PoW 碰撞求解器的 PMC 下载，配合 15~30s 随机步频与 90s+ reCAPTCHA 冷却防范。
 
-### Step 4: Deliver Structured Academic Report
-Once complete, read `PDFs/_manifest.csv` and present a structured summary to the user using the template below.
+### 4. 交付成果与汇报
 
----
-
-## 📊 User Delivery Report Template
+下载完成后，读取生成的 `PDFs/_manifest.csv`，并按照以下格式向用户汇报：
 
 ```markdown
 ### 📥 文献全文（OA）下载完成汇报
 
-- **总文献数量**：N 篇
+- **总检索文献**：N 篇
 - **成功获取全文**：M 篇（占比 XX%）
-- **无法直接获取**：K 篇（主要为商业付费出版物）
+- **未能直接获取**：K 篇（主要为商业期刊付费墙）
 - **输出文件目录**：`PDFs/`
 - **详细对照清单**：`PDFs/_manifest.csv`
 
 #### 📦 获取渠道分布
 | 渠道来源 | 数量 | 说明 |
 |---|---|---|
-| PMC (Hashcash PoW) | X 篇 | 通过 PubMed Central 机构存证与合规解密获取 |
-| Springer / BMC | X 篇 | 开放出版商直链直连 |
-| Frontiers / MDPI | X 篇 | OA 开放期刊官方端点 |
-| Semantic Scholar | X 篇 | 知识库仓储公开副本 |
+| PMC (PoW 求解) | X 篇 | 通过 PubMed Central 机构存证与合规解密获取 |
+| Springer / BMC | X 篇 | 开放出版商直连 |
+| Frontiers / MDPI | X 篇 | 官方开源期刊端点 |
+| Semantic Scholar | X 篇 | 机构仓储公开副本 |
 
-#### ⚠️ 未获取文献诊断与获取建议
-对于未能获取合法 OA 全文的文献，已核实原因如下：
+#### ⚠️ 未获取文献诊断与建议
 1. **商业数据库付费墙（无公开 OA 存证）**：
-   - `[DOI]` 《论文标题》 (Elsevier / Wiley / Sage) ➔ *建议：请通过高校校园网 WebVPN 或图书馆数据库直接下载*
-2. **出版商无 PDF 全文（仅 HTML 格式）**：
-   - `[DOI]` 《论文标题》 (Scialert 等平台)
+   - `[DOI]` 《论文标题》 ➔ *建议：请通过单位/高校校园网 WebVPN 或图书馆馆际互借直接下载*
+2. **出版商无 PDF 文件（仅 HTML 格式）**：
+   - 部分小众期刊仅在网页发布 HTML 全文，不提供 PDF 附件。
 ```
 
 ---
 
-## 🔬 Core Engineering & Verification Reference
-
-### 1. PMC Proof-of-Work (Hashcash Challenge)
-`https://pmc.ncbi.nlm.nih.gov/articles/{PMCID}/pdf/` frequently presents an interstitial HTML challenge containing:
-- `POW_CHALLENGE`: Random alphanumeric token.
-- `POW_DIFFICULTY`: Required leading zeros in hex SHA-256 hash (typically 4).
-- `POW_COOKIE_NAME`: Usually `cloudpmc-viewer-pow`.
-
-**Solver implementation snippet**:
-```python
-def solve_pow(challenge: str, difficulty: int = 4) -> int:
-    target = "0" * difficulty
-    nonce = 0
-    ch_bytes = challenge.encode()
-    while True:
-        if hashlib.sha256(ch_bytes + str(nonce).encode()).hexdigest().startswith(target):
-            return nonce
-        nonce += 1
-```
-Set cookie as `f"{challenge},{nonce}"` and reissue request with a **fresh session**.
-
-### 2. Anti-Bot Discipline (reCAPTCHA Mitigation)
-Rapid sequential downloads trigger Google reCAPTCHA (~20KB HTML without POW constants):
-- **Fresh `requests.Session` per attempt**: Never reuse a tainted session.
-- **15–30s randomized delay**: Mimics human reading and browser behavior.
-- **90s+ cooldown on reCAPTCHA**: Allow server-side suspicion counters to reset.
-
-### 3. Verified Publisher URL Patterns
-
-| Publisher | DOI Prefix | Deterministic URL Format |
-|---|---|---|
-| **Springer** | `10.1007/` | `https://link.springer.com/content/pdf/{doi}.pdf` |
-| **BMC / SpringerOpen** | `10.1186/` | `https://{journal}.biomedcentral.com/counter/pdf/{doi}.pdf` |
-| **Frontiers** | `10.3389/` | `https://www.frontiersin.org/articles/{doi}/pdf` |
-| **MDPI** | `10.3390/` | `https://www.mdpi.com/{issn}/{vol}/{iss}/{art}/pdf` (Parsed from DOI) |
-| **J-Stage** | `10.1292/`, `10.1294/` | `https://www.jstage.jst.go.jp/article/{j}/{vol}/{iss}/{vol}_{page}/_pdf/-char/en` |
-| **Scialert** | `10.3923/` | Parse abstract page `https://scialert.net/abstract/?doi={id}` |
-
-### 4. China Mainland Network Specifics (Verified 2026-10)
-- `www.ncbi.nlm.nih.gov` suffers from DNS pollution in several mainland regions. Always route via `pmc.ncbi.nlm.nih.gov` for PDFs and Europe PMC (`www.ebi.ac.uk/europepmc`) for PMCID lookup.
-- `sciencedirect.com` and `journals.sagepub.com` frequently drop connections/reset SSL.
-- Unpaywall API strictly rejects placeholder emails (returns 422). Use a valid email or rely on Europe PMC / Semantic Scholar.
+## 容错与异常处理
+1. **网络超时**：Phase A 请求若超时会自动跳过进入 Phase B 或下一项，不卡死流程。
+2. **文件真伪校验**：所有返回内容严格经过 `%PDF` 魔数和 >15KB 大小校验，坚决防止将 HTML 拦截报错页保存为 `.pdf`。
