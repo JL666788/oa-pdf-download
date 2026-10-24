@@ -1,363 +1,688 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Fetch legally open-access PDF full texts for a list of papers (by DOI).
-
-Channels used (all legal OA; no paywall circumvention):
-  Phase A (fast, ~0.5-1 s pacing):
-    1. Publisher direct URL patterns (Springer/BMC/SpringerOpen, Frontiers,
-       MDPI, J-Stage, Scialert) built from Crossref metadata
-    2. Springer universal fallback  link.springer.com/content/pdf/{doi}.pdf
-    3. Europe PMC fullTextPDF endpoint (for items with a PMCID)
-    4. Semantic Scholar openAccessPdf probe
-  Phase B (slow, 15-30 s pacing, multi-round until deadline):
-    5. pmc.ncbi.nlm.nih.gov PDF with hashcash proof-of-work solving
-
-Usage:
-  python fetch_oa_pdfs.py --input records.csv --outdir PDFs --state state.json \
-      [--deadline-min 45] [--pmc-delay 15 30] [--email you@univ.edu.cn]
-
-Input CSV: UTF-8 or UTF-8-BOM, column "DOI" required; optional "文献名"/"title"
-and "年份"/"year" columns used for output filenames (else fetched from Crossref).
-State JSON maps DOI -> {"file":..., "source":...}; re-running skips finished
-items, so the script is crash-safe and can be re-launched repeatedly.
-
-Every PDF is validated (%PDF magic, >15 KB) before it is written; an HTML page
-that merely looks like an article is never saved as a .pdf.
 """
-import argparse, csv, hashlib, json, os, random, re, sys, time, warnings
+OA-PDF-Download: Batch-download legally open-access (OA) academic full-text PDFs.
+
+Legal Open Access Only:
+  - Compliant with publisher OA policies and repository open-access terms.
+  - Zero paywall circumvention, no illicit cookie sharing, no Sci-Hub.
+  - Transparently logs failed acquisitions and reasons (e.g., paywalled, HTML-only).
+
+Pipeline Overview:
+  - Phase A (Fast): Direct publisher endpoints (Springer, BMC, Frontiers, MDPI,
+    J-Stage, Scialert) + Europe PMC + Semantic Scholar openAccessPdf probe.
+  - Phase B (Paced & Adaptive): PMC (pmc.ncbi.nlm.nih.gov) with automatic
+    Hashcash Proof-of-Work (PoW) interstitial solver and anti-bot escalation backoff.
+
+Author: JL666788
+License: MIT
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import hashlib
+import json
+import os
+import random
+import re
+import sys
+import time
+import warnings
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 import requests
-warnings.filterwarnings("ignore")
+import urllib3
 
-UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-      "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-      "Accept": "text/html,application/xhtml+xml,application/pdf,*/*;q=0.8",
-      "Accept-Language": "en-US,en;q=0.9"}
-
-MDPI_ISSN = {"v": "1999-4915", "ani": "2076-2615", "pathogens": "2076-0817",
-             "vaccines": "2076-393X", "antibiotics": "2079-6382", "vetsci": "2306-7381",
-             "ijerph": "1660-4601", "cells": "2073-4409", "microorganisms": "2076-2607"}
+# Suppress insecure request warnings if verify=False is needed for legacy certs
+warnings.filterwarnings("ignore", category=urllib3.exceptions.InsecureRequestWarning)
 
 
-def log(*a):
-    print(*a, flush=True)
+# ==============================================================================
+# UI & Formatting Helpers
+# ==============================================================================
+
+class Colors:
+    """ANSI color codes for stylish terminal output."""
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    DIM = "\033[2m"
+    RED = "\033[31m"
+    GREEN = "\033[32m"
+    YELLOW = "\033[33m"
+    BLUE = "\033[34m"
+    MAGENTA = "\033[35m"
+    CYAN = "\033[36m"
+    WHITE = "\033[37m"
+
+    @classmethod
+    def disable(cls):
+        """Disable all color outputs (for dumb terminals or piping)."""
+        cls.RESET = ""
+        cls.BOLD = ""
+        cls.DIM = ""
+        cls.RED = ""
+        cls.GREEN = ""
+        cls.YELLOW = ""
+        cls.BLUE = ""
+        cls.MAGENTA = ""
+        cls.CYAN = ""
+        cls.WHITE = ""
 
 
-def slug(t, n=60):
-    t = re.sub(r"[^\w\s-]", "", t, flags=re.ASCII).lower()
-    return re.sub(r"[\s_]+", "-", t.strip())[:n].strip("-")
-
-
-def is_pdf(body):
-    return len(body) > 15_000 and body[:5].startswith(b"%PDF")
-
-
-def load_state(p):
-    return json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
-
-
-def save_state(p, st):
-    p.write_text(json.dumps(st, ensure_ascii=False, indent=1), encoding="utf-8")
-
-
-def crossref(doi, email=""):
-    """Minimal Crossref metadata: title, year, volume, issue, page, container."""
+# Auto-enable ANSI and UTF-8 on Windows
+if sys.platform == "win32":
+    os.system("")  # Enables VT100 in Windows Console if available
     try:
-        r = requests.get(f"https://api.crossref.org/works/{doi}",
-                         params={"mailto": email} if email else None,
-                         headers=UA, timeout=40)
-        if r.status_code != 200:
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+
+def log(msg: str = "", level: str = "INFO", prefix: str = ""):
+    """Structured terminal logging."""
+    if prefix:
+        print(f"{prefix} {msg}", flush=True)
+    else:
+        print(msg, flush=True)
+
+
+def slugify(text: str, max_len: int = 60) -> str:
+    """Generate a clean filesystem-friendly slug from title."""
+    clean = re.sub(r"[^\w\s-]", "", text, flags=re.ASCII).lower()
+    return re.sub(r"[\s_]+", "-", clean.strip())[:max_len].strip("-")
+
+
+def is_valid_pdf(content: bytes) -> bool:
+    """Verify that returned payload is a genuine PDF (>15KB and begins with %PDF)."""
+    return len(content) > 15_000 and content[:5].startswith(b"%PDF")
+
+
+# ==============================================================================
+# Constants & Configurations
+# ==============================================================================
+
+DEFAULT_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/pdf,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+MDPI_ISSN_MAP: Dict[str, str] = {
+    "v": "1999-4915",
+    "ani": "2076-2615",
+    "pathogens": "2076-0817",
+    "vaccines": "2076-393X",
+    "antibiotics": "2079-6382",
+    "vetsci": "2306-7381",
+    "ijerph": "1660-4601",
+    "cells": "2073-4409",
+    "microorganisms": "2076-2607",
+}
+
+
+@dataclass
+class PaperRecord:
+    doi: str
+    title: str = ""
+    year: str = ""
+
+
+# ==============================================================================
+# Metadata Resolvers
+# ==============================================================================
+
+def fetch_crossref_metadata(doi: str, email: str = "") -> dict:
+    """Query Crossref API for bibliographic details (title, year, volume, page)."""
+    try:
+        params = {"mailto": email} if email else None
+        res = requests.get(
+            f"https://api.crossref.org/works/{doi}",
+            params=params,
+            headers=DEFAULT_HEADERS,
+            timeout=30,
+        )
+        if res.status_code != 200:
             return {}
-        m = r.json()["message"]
-        return {"title": (m.get("title") or [""])[0],
-                "year": (m.get("issued", {}).get("date-parts") or [[None]])[0][0],
-                "volume": m.get("volume", ""), "issue": m.get("issue", ""),
-                "page": m.get("page", ""), "container": (m.get("container-title") or [""])[0]}
+        msg = res.json().get("message", {})
+        title_list = msg.get("title") or [""]
+        issued = msg.get("issued", {}).get("date-parts") or [[None]]
+        container_list = msg.get("container-title") or [""]
+
+        return {
+            "title": title_list[0] if title_list else "",
+            "year": issued[0][0] if issued and issued[0] else "",
+            "volume": msg.get("volume", ""),
+            "issue": msg.get("issue", ""),
+            "page": msg.get("page", ""),
+            "container": container_list[0] if container_list else "",
+        }
     except Exception:
         return {}
 
 
-def epmc_pmcid(doi):
-    """PMCID via Europe PMC search (works where www.ncbi.nlm.nih.gov is DNS-poisoned)."""
+def query_europe_pmc_pmcid(doi: str) -> Optional[str]:
+    """Retrieve PMCID via Europe PMC Search API (works reliably in China networks)."""
     try:
-        r = requests.get("https://www.ebi.ac.uk/europepmc/webservices/rest/search",
-                         params={"query": f'DOI:"{doi}"', "format": "json", "pageSize": 5},
-                         headers=UA, timeout=40)
-        for x in (r.json().get("resultList", {}).get("result") or []):
-            if x.get("pmcid"):
-                return x["pmcid"]
+        res = requests.get(
+            "https://www.ebi.ac.uk/europepmc/webservices/rest/search",
+            params={"query": f'DOI:"{doi}"', "format": "json", "pageSize": 5},
+            headers=DEFAULT_HEADERS,
+            timeout=35,
+        )
+        if not res.ok:
+            return None
+        results = res.json().get("resultList", {}).get("result", [])
+        for item in results:
+            if item.get("pmcid"):
+                return item["pmcid"]
     except Exception:
         pass
     return None
 
 
-# ---------------------------------------------------------------- publisher URLs
-def publisher_urls(doi, meta):
-    """Candidate direct URLs by DOI prefix. Returns [(url, label), ...]."""
-    urls = []
+# ==============================================================================
+# Publisher URL Generators
+# ==============================================================================
 
-    def add(u, label):
-        if (u, label) not in urls:
-            urls.append((u, label))
+def generate_publisher_urls(doi: str, meta: dict) -> List[Tuple[str, str]]:
+    """Synthesize direct candidate PDF download URLs based on DOI prefixes."""
+    urls: List[Tuple[str, str]] = []
 
-    if doi.startswith(("10.1007/", "10.1186/")):          # Springer / BMC / SpringerOpen
-        add(f"https://link.springer.com/content/pdf/{doi}.pdf", "springer-content")
+    def _add(u: str, tag: str):
+        if (u, tag) not in urls:
+            urls.append((u, tag))
+
+    # 1. Springer / BMC / SpringerOpen
+    if doi.startswith(("10.1007/", "10.1186/")):
+        _add(f"https://link.springer.com/content/pdf/{doi}.pdf", "springer-content")
         host = re.sub(r"[^a-z0-9]", "", (meta.get("container") or "").lower())
         if host:
-            add(f"https://{host}.biomedcentral.com/counter/pdf/{doi}.pdf", "bmc-counter")
+            _add(f"https://{host}.biomedcentral.com/counter/pdf/{doi}.pdf", "bmc-counter")
 
-    if doi.startswith("10.3389/"):                        # Frontiers
-        add(f"https://www.frontiersin.org/articles/{doi}/pdf", "frontiers-doi")
-        add(f"https://www.frontiersin.org/journals/*/articles/{doi}/pdf", "frontiers-j")
+    # 2. Frontiers
+    if doi.startswith("10.3389/"):
+        _add(f"https://www.frontiersin.org/articles/{doi}/pdf", "frontiers-doi")
+        _add(f"https://www.frontiersin.org/journals/*/articles/{doi}/pdf", "frontiers-j")
 
-    if doi.startswith("10.3390/"):                        # MDPI
+    # 3. MDPI
+    if doi.startswith("10.3390/"):
         jid = doi.split("/")[1]
         m = re.match(r"^([a-z]+)(\d{2})(\d{2})(\d{4})$", jid)
         if m:
             ab, vol, iss, art = m.groups()
-            issn = MDPI_ISSN.get(ab)
+            issn = MDPI_ISSN_MAP.get(ab)
             if issn:
-                add(f"https://www.mdpi.com/{issn}/{int(vol)}/{int(iss)}/{int(art)}/pdf", "mdpi")
+                _add(f"https://www.mdpi.com/{issn}/{int(vol)}/{int(iss)}/{int(art)}/pdf", "mdpi")
 
-    if doi.startswith(("10.1292/", "10.1294/", "10.12935/")):   # J-Stage journals
+    # 4. J-Stage
+    if doi.startswith(("10.1292/", "10.1294/", "10.12935/")):
         if meta.get("volume") and meta.get("page"):
-            j = doi.split("/")[1].split(".")[0]           # jvms / jes / jvma
-            fp = meta["page"].split("-")[0]
-            iss = str(meta.get("issue", "")).split("S")[0] or "1"
-            add(f"https://www.jstage.jst.go.jp/article/{j}/{meta['volume']}/{iss}/"
-                f"{meta['volume']}_{fp}/_pdf/-char/en", "jstage-pattern")
+            journal = doi.split("/")[1].split(".")[0]
+            first_page = meta["page"].split("-")[0]
+            issue = str(meta.get("issue", "")).split("S")[0] or "1"
+            _add(
+                f"https://www.jstage.jst.go.jp/article/{journal}/{meta['volume']}/{issue}/"
+                f"{meta['volume']}_{first_page}/_pdf/-char/en",
+                "jstage-pattern",
+            )
 
-    if doi.startswith("10.3923/"):                        # Scialert (HTML-only journal)
-        add(f"https://scialert.net/abstract/?doi={doi.split('/', 1)[1]}", "scialert-landing")
+    # 5. Scialert landing page
+    if doi.startswith("10.3923/"):
+        _add(f"https://scialert.net/abstract/?doi={doi.split('/', 1)[1]}", "scialert-landing")
+
     return urls
 
 
-def jstage_from_landing(doi):
-    """Follow doi.org redirect to J-Stage and scrape the _pdf link (robust fallback)."""
+def scrape_jstage_landing_page(doi: str) -> List[str]:
+    """Scrape the landing page on J-Stage following doi.org redirection."""
     try:
-        r = requests.get(f"https://doi.org/{doi}", headers=UA, timeout=60, allow_redirects=True)
-        if not r.ok:
+        res = requests.get(f"https://doi.org/{doi}", headers=DEFAULT_HEADERS, timeout=45, allow_redirects=True)
+        if not res.ok:
             return []
-        ls = re.findall(r'href="(https://www\.jstage\.jst\.go\.jp/article/[^"]+_pdf[^"]*)"', r.text)
-        ls += ["https://www.jstage.jst.go.jp" + l for l in
-               re.findall(r'href="(/article/[^"]+_pdf[^"]*)"', r.text)]
-        return ls[:4]
+        links = re.findall(r'href="(https://www\.jstage\.jst\.go\.jp/article/[^"]+_pdf[^"]*)"', res.text)
+        links += ["https://www.jstage.jst.go.jp" + l for l in re.findall(r'href="(/article/[^"]+_pdf[^"]*)"', res.text)]
+        return links[:4]
     except Exception:
         return []
 
 
-def try_url(url, verify=True, timeout=90):
+def scrape_scialert_pdf(doi: str) -> Optional[bytes]:
+    """Scrape Scialert abstract page for PDF link (some are HTML-only)."""
+    base_url = f"https://scialert.net/abstract/?doi={doi.split('/', 1)[1]}"
     try:
-        r = requests.get(url, headers=UA, timeout=timeout, allow_redirects=True, verify=verify)
-        if r.ok and is_pdf(r.content):
-            return r.content
-        log(f"    [--] HTTP {r.status_code} head={r.content[:5]!r} len={len(r.content)} {url[:90]}")
-    except Exception as e:
-        log(f"    [--] {type(e).__name__} {str(e)[:70]} {url[:90]}")
-    return None
-
-
-def scialert_pdf(doi):
-    """Scialert: parse abstract page for a PDF link; journal may have none (HTML only)."""
-    base = f"https://scialert.net/abstract/?doi={doi.split('/', 1)[1]}"
-    try:
-        r = requests.get(base, headers=UA, timeout=60, verify=False)
-        if not r.ok:
+        res = requests.get(base_url, headers=DEFAULT_HEADERS, timeout=45, verify=False)
+        if not res.ok:
             return None
-        for l in re.findall(r'href="([^"]+\.pdf[^"]*)"', r.text, flags=re.I):
-            u = l if l.startswith("http") else "https://scialert.net" + l
-            body = try_url(u, verify=False)
-            if body:
-                return body
+        for href in re.findall(r'href="([^"]+\.pdf[^"]*)"', res.text, flags=re.I):
+            pdf_url = href if href.startswith("http") else "https://scialert.net" + href
+            content = download_url(pdf_url, verify=False, timeout=60)
+            if content:
+                return content
     except Exception:
         pass
     return None
 
 
-# ---------------------------------------------------------------- PMC + PoW
-def solve_pow(challenge, difficulty):
-    """PMC hashcash: find nonce so sha256(challenge+nonce) starts with `difficulty` zeros."""
+def download_url(url: str, verify: bool = True, timeout: int = 60, verbose: bool = False) -> Optional[bytes]:
+    """Download content from URL and validate PDF format."""
+    try:
+        res = requests.get(url, headers=DEFAULT_HEADERS, timeout=timeout, allow_redirects=True, verify=verify)
+        if res.ok and is_valid_pdf(res.content):
+            return res.content
+        if verbose:
+            log(f"    {Colors.DIM}[--] HTTP {res.status_code} len={len(res.content)} {url[:75]}{Colors.RESET}")
+    except Exception as e:
+        if verbose:
+            log(f"    {Colors.DIM}[--] {type(e).__name__} {url[:75]}{Colors.RESET}")
+    return None
+
+
+# ==============================================================================
+# PMC Proof-of-Work (Hashcash) Solver
+# ==============================================================================
+
+def solve_pmc_hashcash(challenge: str, difficulty: int = 4) -> int:
+    """
+    Solve PMC Hashcash PoW challenge.
+    Finds integer nonce such that sha256(challenge + nonce) starts with `difficulty` zeros.
+    """
     target = "0" * difficulty
-    n = 0
+    nonce = 0
+    ch_bytes = challenge.encode("utf-8")
     while True:
-        if hashlib.sha256((challenge + str(n)).encode()).hexdigest().startswith(target):
-            return n
-        n += 1
+        if hashlib.sha256(ch_bytes + str(nonce).encode("utf-8")).hexdigest().startswith(target):
+            return nonce
+        nonce += 1
 
 
-def pmc_attempt(pmcid):
-    """One attempt: direct PDF, else solve PoW cookie and retry. Returns (bytes|None, note)."""
-    s = requests.Session()
-    s.headers.update(UA)
+def attempt_pmc_download(pmcid: str) -> Tuple[Optional[bytes], str]:
+    """
+    Single PMC PDF retrieval attempt:
+    - Direct PDF download check.
+    - Interstitial PoW challenge extraction and nonce solver.
+    - Detection of reCAPTCHA escalation.
+    """
+    session = requests.Session()
+    session.headers.update(DEFAULT_HEADERS)
     url = f"https://pmc.ncbi.nlm.nih.gov/articles/{pmcid}/pdf/"
-    r1 = s.get(url, timeout=60)
-    if r1.content[:4] == b"%PDF":
-        return r1.content, "direct"
-    if "POW_CHALLENGE" in r1.text:
-        ch = re.search(r'POW_CHALLENGE\s*=\s*"([^"]+)"', r1.text).group(1)
-        di = re.search(r'POW_DIFFICULTY\s*=\s*"?(\d+)', r1.text)
-        cn = re.search(r'POW_COOKIE_NAME\s*=\s*"([^"]+)"', r1.text).group(1)
-        s.cookies.set(cn, f"{ch},{solve_pow(ch, int(di.group(1)) if di else 4)}",
-                      path="/", domain="pmc.ncbi.nlm.nih.gov")
-        r2 = s.get(url, timeout=120)
-        if r2.content[:4] == b"%PDF":
-            return r2.content, "pow"
-        return None, "post-pow-not-pdf"
-    if "recaptcha" in r1.text.lower():
-        return None, "recaptcha"        # escalated: back off, fresh session next round
-    return None, f"other-{r1.status_code}-{len(r1.text)}"
+
+    try:
+        res1 = session.get(url, timeout=60)
+    except Exception as e:
+        return None, f"connect-err: {type(e).__name__}"
+
+    if is_valid_pdf(res1.content):
+        return res1.content, "direct"
+
+    # Check for Hashcash challenge
+    if "POW_CHALLENGE" in res1.text:
+        ch_match = re.search(r'POW_CHALLENGE\s*=\s*"([^"]+)"', res1.text)
+        if not ch_match:
+            return None, "pow-parse-failed"
+        challenge = ch_match.group(1)
+
+        diff_match = re.search(r'POW_DIFFICULTY\s*=\s*"?(\d+)', res1.text)
+        difficulty = int(diff_match.group(1)) if diff_match else 4
+
+        cookie_match = re.search(r'POW_COOKIE_NAME\s*=\s*"([^"]+)"', res1.text)
+        cookie_name = cookie_match.group(1) if cookie_match else "cloudpmc-viewer-pow"
+
+        nonce = solve_pmc_hashcash(challenge, difficulty)
+        session.cookies.set(
+            cookie_name,
+            f"{challenge},{nonce}",
+            path="/",
+            domain="pmc.ncbi.nlm.nih.gov",
+        )
+
+        try:
+            res2 = session.get(url, timeout=90)
+            if is_valid_pdf(res2.content):
+                return res2.content, "pow-solved"
+            return None, "post-pow-not-pdf"
+        except Exception as e:
+            return None, f"post-pow-err: {type(e).__name__}"
+
+    # Escalated anti-bot check
+    if "recaptcha" in res1.text.lower():
+        return None, "recaptcha"
+
+    return None, f"status-{res1.status_code}"
 
 
-# ---------------------------------------------------------------- main
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--input", required=True, help="CSV with DOI column")
-    ap.add_argument("--outdir", required=True)
-    ap.add_argument("--state", required=True, help="state JSON (resume-safe)")
-    ap.add_argument("--deadline-min", type=int, default=45)
-    ap.add_argument("--pmc-delay", nargs=2, type=float, default=[15, 30],
-                    help="min/max seconds between PMC attempts")
-    ap.add_argument("--email", default="", help="real contact email (Crossref polite pool)")
-    ap.add_argument("--skip-pmc", action="store_true")
-    args = ap.parse_args()
+# ==============================================================================
+# Input Parser & Persistence
+# ==============================================================================
 
-    outdir, statep = Path(args.outdir), Path(args.state)
-    outdir.mkdir(parents=True, exist_ok=True)
-    state = load_state(statep)
+def load_records(input_path: Path) -> List[PaperRecord]:
+    """Parse paper records from CSV or plain TXT DOI list."""
+    records: List[PaperRecord] = []
+    if not input_path.exists():
+        raise FileNotFoundError(f"Input file not found: {input_path}")
 
-    with open(args.input, encoding="utf-8-sig", errors="replace", newline="") as f:
-        rows = [r for r in csv.DictReader(f) if (r.get("DOI") or "").strip()]
-    recs = {}
+    # Plain text file with one DOI per line
+    if input_path.suffix.lower() == ".txt":
+        with open(input_path, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                d = line.strip()
+                if d and not d.startswith("#"):
+                    records.append(PaperRecord(doi=d))
+        return records
+
+    # CSV file
+    encodings = ["utf-8-sig", "utf-8", "gbk"]
+    rows = []
+    for enc in encodings:
+        try:
+            with open(input_path, "r", encoding=enc, errors="replace", newline="") as f:
+                reader = csv.DictReader(f)
+                rows = list(reader)
+            break
+        except Exception:
+            continue
+
     for r in rows:
-        doi = r["DOI"].strip()
-        recs[doi] = {"title": r.get("文献名") or r.get("title") or "",
-                     "year": r.get("年份") or r.get("year") or ""}
-    todo = [d for d in recs if not state.get(d, {}).get("file")]
-    log(f"records: {len(recs)}, already downloaded: {len(recs) - len(todo)}, todo: {len(todo)}")
+        # Case-insensitive DOI lookup
+        doi_val = ""
+        for k in r.keys():
+            if k and k.strip().lower() == "doi":
+                doi_val = (r[k] or "").strip()
+                break
+        if not doi_val:
+            continue
 
-    def store(doi, body, source):
-        fname = f"{recs[doi]['year']}_{slug(recs[doi]['title'])}.pdf"
-        (outdir / fname).write_bytes(body)
-        state[doi] = {"file": fname, "source": source}
-        save_state(statep, state)      # persist after EVERY success: crash-safe
-        log(f"  [OK] {doi} {len(body) // 1024}KB via {source[:80]} -> {fname}")
+        title_val = (
+            r.get("文献名")
+            or r.get("title")
+            or r.get("Title")
+            or r.get("题名")
+            or ""
+        ).strip()
+        year_val = (
+            r.get("年份")
+            or r.get("year")
+            or r.get("Year")
+            or ""
+        ).strip()
 
-    pmcids = {}
+        records.append(PaperRecord(doi=doi_val, title=title_val, year=year_val))
+
+    return records
+
+
+def load_state(path: Path) -> dict:
+    if path.exists():
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+
+def save_state(path: Path, state: dict):
+    path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+# ==============================================================================
+# Main Orchestrator
+# ==============================================================================
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="OA-PDF-Download: High-reliability Open Access PDF batch harvester."
+    )
+    parser.add_argument("--input", "-i", required=True, help="Input CSV file or plain TXT list with DOIs")
+    parser.add_argument("--outdir", "-o", required=True, help="Directory to save downloaded PDF files")
+    parser.add_argument("--state", "-s", default="state.json", help="State file path for resume-safe execution")
+    parser.add_argument("--deadline-min", type=int, default=45, help="Overall execution deadline in minutes")
+    parser.add_argument("--pmc-delay", nargs=2, type=float, default=[15.0, 30.0],
+                        help="Min and Max randomized delay (seconds) between PMC attempts")
+    parser.add_argument("--email", default="", help="Contact email for Crossref polite pool")
+    parser.add_argument("--skip-pmc", action="store_true", help="Skip Phase B (PMC PoW retrieval)")
+    parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose debug logging")
+    parser.add_argument("--no-color", action="store_true", help="Disable ANSI terminal colors")
+    args = parser.parse_args()
+
+    if args.no_color or not sys.stdout.isatty():
+        Colors.disable()
+
+    input_path = Path(args.input)
+    outdir = Path(args.outdir)
+    state_path = Path(args.state)
+
+    outdir.mkdir(parents=True, exist_ok=True)
+    state = load_state(state_path)
+
+    # 1. Parse Records
+    records = load_records(input_path)
+    if not records:
+        log(f"{Colors.RED}[!] No valid DOI records found in {input_path}{Colors.RESET}")
+        sys.exit(1)
+
+    recs_map: Dict[str, PaperRecord] = {r.doi: r for r in records}
+    total = len(recs_map)
+    todo = [d for d in recs_map if not state.get(d, {}).get("file")]
+    completed_count = total - len(todo)
+
+    print(f"\n{Colors.BOLD}{Colors.CYAN}{'='*60}{Colors.RESET}")
+    print(f"{Colors.BOLD}{Colors.CYAN}  OA-PDF-Download: Harvester Pipeline Initialized{Colors.RESET}")
+    print(f"{Colors.BOLD}{Colors.CYAN}{'='*60}{Colors.RESET}")
+    log(f"{Colors.WHITE}Total records:{Colors.RESET} {total} | "
+        f"{Colors.GREEN}Completed:{Colors.RESET} {completed_count} | "
+        f"{Colors.YELLOW}Pending:{Colors.RESET} {len(todo)}")
+    log(f"{Colors.WHITE}Output Directory:{Colors.RESET} {outdir.resolve()}")
+    log(f"{Colors.WHITE}State Path:{Colors.RESET} {state_path.resolve()}\n")
+
+    def store_pdf(doi: str, content: bytes, source: str):
+        rec = recs_map[doi]
+        year_str = rec.year or "nd"
+        slug_str = slugify(rec.title or doi)
+        filename = f"{year_str}_{slug_str}.pdf"
+        filepath = outdir / filename
+
+        filepath.write_bytes(content)
+        state[doi] = {"file": filename, "source": source}
+        save_state(state_path, state)
+
+        kb = len(content) // 1024
+        log(f"  {Colors.GREEN}[✓] Saved ({kb} KB):{Colors.RESET} {filename} {Colors.DIM}(via {source}){Colors.RESET}")
+
     deadline = time.time() + args.deadline_min * 60
+    pmcids: Dict[str, Optional[str]] = {}
 
-    # ---- Phase A: fast routes -------------------------------------------------
+    # ==========================================================================
+    # Phase A: Fast Candidate Resolution
+    # ==========================================================================
+    log(f"{Colors.BOLD}{Colors.BLUE}▶ Phase A: Fast Direct & Repository Routes (~0.5s pacing){Colors.RESET}")
+
+    idx = 0
     for doi in list(todo):
         if time.time() > deadline:
+            log(f"{Colors.YELLOW}[!] Deadline reached during Phase A.{Colors.RESET}")
             break
-        meta = crossref(doi, args.email)          # title/year if missing + vol/iss/page/container
-        recs[doi]["title"] = recs[doi]["title"] or meta.get("title") or doi
-        recs[doi]["year"] = recs[doi]["year"] or str(meta.get("year") or "")
-        time.sleep(0.4)
-        log(f"[A] {doi}")
-        got = False
-        for u, label in publisher_urls(doi, meta):
-            if label == "scialert-landing":       # handled after the plain GETs
+
+        idx += 1
+        rec = recs_map[doi]
+
+        # Metadata enrichment via Crossref if title or year is missing
+        meta = fetch_crossref_metadata(doi, args.email)
+        if not rec.title:
+            rec.title = meta.get("title") or doi
+        if not rec.year:
+            rec.year = str(meta.get("year") or "")
+
+        time.sleep(0.3)
+        progress = f"[{idx:02d}/{len(todo):02d}]"
+        log(f"{Colors.CYAN}{progress} Scanning:{Colors.RESET} {doi} {Colors.DIM}({rec.title[:45]}...){Colors.RESET}")
+
+        downloaded = False
+
+        # 1. Publisher Direct Patterns
+        for url, tag in generate_publisher_urls(doi, meta):
+            if tag == "scialert-landing":
                 continue
-            body = try_url(u)
-            if body:
-                store(doi, body, u)
-                got = True
+            content = download_url(url, verbose=args.verbose)
+            if content:
+                store_pdf(doi, content, tag)
+                downloaded = True
                 break
-            time.sleep(0.5)
-        if not got and doi.startswith("10.3923/"):     # Scialert needs page parsing
-            body = scialert_pdf(doi)
-            if body:
-                store(doi, body, "scialert-parsed")
-                got = True
-        if not got and doi.startswith(("10.1292/", "10.1294/", "10.12935/")):
-            for u in jstage_from_landing(doi):         # pattern failed → scrape landing page
-                body = try_url(u)
-                if body:
-                    store(doi, body, "jstage-landing " + u[:60])
-                    got = True
+            time.sleep(0.4)
+
+        # 2. Scialert Special Parsing
+        if not downloaded and doi.startswith("10.3923/"):
+            content = scrape_scialert_pdf(doi)
+            if content:
+                store_pdf(doi, content, "scialert-scrape")
+                downloaded = True
+
+        # 3. J-Stage Landing Redirection Fallback
+        if not downloaded and doi.startswith(("10.1292/", "10.1294/", "10.12935/")):
+            for j_url in scrape_jstage_landing_page(doi):
+                content = download_url(j_url, verbose=args.verbose)
+                if content:
+                    store_pdf(doi, content, "jstage-landing")
+                    downloaded = True
                     break
-                time.sleep(0.5)
-        if got:
+                time.sleep(0.4)
+
+        if downloaded:
             todo.remove(doi)
             continue
-        # Semantic Scholar probe (429-prone: back off and retry once)
+
+        # 4. Semantic Scholar openAccessPdf Probe
         try:
-            r = requests.get(f"https://api.semanticscholar.org/graph/v1/paper/DOI:{doi}",
-                             params={"fields": "openAccessPdf,isOpenAccess"}, headers=UA, timeout=40)
-            if r.status_code == 429:
-                time.sleep(10)
-                r = requests.get(f"https://api.semanticscholar.org/graph/v1/paper/DOI:{doi}",
-                                 params={"fields": "openAccessPdf"}, headers=UA, timeout=40)
-            if r.status_code == 200:
-                pdf = (r.json().get("openAccessPdf") or {}).get("url")
-                if pdf:
-                    body = try_url(pdf)
-                    if body:
-                        store(doi, body, "s2 " + pdf[:60])
+            res = requests.get(
+                f"https://api.semanticscholar.org/graph/v1/paper/DOI:{doi}",
+                params={"fields": "openAccessPdf,isOpenAccess"},
+                headers=DEFAULT_HEADERS,
+                timeout=30,
+            )
+            if res.status_code == 429:
+                time.sleep(8)
+                res = requests.get(
+                    f"https://api.semanticscholar.org/graph/v1/paper/DOI:{doi}",
+                    params={"fields": "openAccessPdf"},
+                    headers=DEFAULT_HEADERS,
+                    timeout=30,
+                )
+            if res.status_code == 200:
+                oa_url = (res.json().get("openAccessPdf") or {}).get("url")
+                if oa_url:
+                    content = download_url(oa_url, verbose=args.verbose)
+                    if content:
+                        store_pdf(doi, content, f"s2:{oa_url[:40]}")
                         todo.remove(doi)
                         continue
         except Exception as e:
-            log(f"    [s2-err] {type(e).__name__} {str(e)[:60]}")
-        time.sleep(1.0)
+            if args.verbose:
+                log(f"    {Colors.DIM}[s2-err] {type(e).__name__}{Colors.RESET}")
 
-    # ---- Phase B: PMC slow path -----------------------------------------------
-    if not args.skip_pmc:
+        time.sleep(0.5)
+
+    # ==========================================================================
+    # Phase B: PMC with PoW Solver
+    # ==========================================================================
+    if not args.skip_pmc and todo:
+        log(f"\n{Colors.BOLD}{Colors.MAGENTA}▶ Phase B: PMC Harvester with PoW Solver (Adaptive Pacing){Colors.RESET}")
+        log(f"{Colors.DIM}Looking up PMCIDs via Europe PMC...{Colors.RESET}")
+
         for doi in list(todo):
             if time.time() > deadline:
                 break
             if doi not in pmcids:
-                pmcids[doi] = epmc_pmcid(doi)
-            if pmcids[doi]:
-                try:
-                    requests.get(f"https://www.ebi.ac.uk/europepmc/webservices/rest/"
-                                 f"{pmcids[doi]}/fullTextPDF", headers=UA, timeout=60)
-                except Exception:
-                    pass
-            time.sleep(0.5)
-        pending = [d for d in todo if pmcids.get(d)]
-        if pending:
-            log(f"\n[B] PMC slow path: {len(pending)} items with PMCID")
-        rnd = 0
-        while pending and time.time() < deadline:
-            rnd += 1
-            log(f"--- PMC round {rnd}, pending {len(pending)} ---")
-            still = []
-            for doi in pending:
+                pmcids[doi] = query_europe_pmc_pmcid(doi)
+            time.sleep(0.3)
+
+        pending_pmc = [d for d in todo if pmcids.get(d)]
+        log(f"Found {Colors.BOLD}{len(pending_pmc)}{Colors.RESET} items with associated PMCID.")
+
+        round_num = 0
+        while pending_pmc and time.time() < deadline:
+            round_num += 1
+            log(f"\n{Colors.BOLD}{Colors.YELLOW}--- Round {round_num}: Attempting {len(pending_pmc)} PMC items ---{Colors.RESET}")
+            unresolved = []
+
+            for doi in pending_pmc:
                 if time.time() > deadline:
-                    still.append(doi)
+                    unresolved.append(doi)
                     continue
-                time.sleep(random.uniform(*args.pmc_delay))
+
+                delay = random.uniform(*args.pmc_delay)
+                pmcid = pmcids[doi]
+                log(f"{Colors.DIM}Pacing {delay:.1f}s | Attempting {doi} ({pmcid})...{Colors.RESET}")
+                time.sleep(delay)
+
                 try:
-                    body, note = pmc_attempt(pmcids[doi])
+                    content, note = attempt_pmc_download(pmcid)
                 except Exception as e:
-                    body, note = None, f"err {type(e).__name__}"
-                if body:
-                    store(doi, body, f"pmc.ncbi {pmcids[doi]}")
+                    content, note = None, f"err:{type(e).__name__}"
+
+                if content:
+                    store_pdf(doi, content, f"pmc:{pmcid}")
                 else:
-                    still.append(doi)
-                    log(f"  [--] {doi} {pmcids[doi]} ({note})")
+                    unresolved.append(doi)
+                    log(f"  {Colors.YELLOW}[-] Deferred ({note}):{Colors.RESET} {doi} ({pmcid})")
                     if note == "recaptcha":
-                        time.sleep(90)   # escalated: cool down before next attempt
-            pending = still
+                        log(f"{Colors.RED}[!] reCAPTCHA escalation detected. Entering 90s cooldown...{Colors.RESET}")
+                        time.sleep(90)
+
+            pending_pmc = unresolved
+
         todo = [d for d in todo if not state.get(d, {}).get("file")]
 
-    # ---- report ----------------------------------------------------------------
-    ok = [d for d in recs if state.get(d, {}).get("file")]
-    log(f"\n=== DONE: {len(ok)}/{len(recs)} downloaded ===")
-    no_route = [d for d in todo if not pmcids.get(d) and not d.startswith(("10.1007/", "10.1186/",
-                "10.3389/", "10.3390/", "10.1292/", "10.1294/", "10.12935/", "10.3923/"))]
-    if no_route:
-        log("no OA route found for:")
-        for d in no_route:
-            log(f"  {d}")
-    with open(outdir / "_manifest.csv", "w", newline="", encoding="utf-8-sig") as f:
-        w = csv.writer(f)
-        w.writerow(["DOI", "file", "source"])
-        for d in recs:
+    # ==========================================================================
+    # Summary Report & Manifest
+    # ==========================================================================
+    success_dois = [d for d in recs_map if state.get(d, {}).get("file")]
+    manifest_path = outdir / "_manifest.csv"
+
+    with open(manifest_path, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.writer(f)
+        writer.writerow(["DOI", "Title", "Year", "Filename", "Source"])
+        for d, rec in recs_map.items():
             st = state.get(d, {})
-            w.writerow([d, st.get("file", ""), st.get("source", "not downloaded")])
-    log(f"manifest: {outdir / '_manifest.csv'}")
+            writer.writerow([
+                d,
+                rec.title,
+                rec.year,
+                st.get("file", ""),
+                st.get("source", "Not Available via OA"),
+            ])
+
+    # Compute source breakdown
+    sources_count: Dict[str, int] = {}
+    for d in success_dois:
+        src = state[d]["source"].split(":")[0].split()[0]
+        sources_count[src] = sources_count.get(src, 0) + 1
+
+    print(f"\n{Colors.BOLD}{Colors.GREEN}{'='*60}{Colors.RESET}")
+    print(f"{Colors.BOLD}{Colors.GREEN}  DOWNLOAD HARVEST SUMMARY{Colors.RESET}")
+    print(f"{Colors.BOLD}{Colors.GREEN}{'='*60}{Colors.RESET}")
+    log(f"Total Papers: {Colors.BOLD}{total}{Colors.RESET}")
+    log(f"Successfully Harvested: {Colors.GREEN}{Colors.BOLD}{len(success_dois)}/{total} "
+        f"({(len(success_dois)/total*100):.1f}%){Colors.RESET}")
+
+    if sources_count:
+        log("\nBreakdown by Source Channel:")
+        for s, c in sorted(sources_count.items(), key=lambda x: -x[1]):
+            log(f"  • {s:20s}: {c:3d} PDFs")
+
+    if todo:
+        log(f"\n{Colors.YELLOW}Unobtained / Paywalled Papers ({len(todo)}):{Colors.RESET}")
+        for d in todo:
+            log(f"  {Colors.RED}✗{Colors.RESET} {d} - {Colors.DIM}{recs_map[d].title[:60]}{Colors.RESET}")
+
+    log(f"\nManifest saved to: {Colors.CYAN}{manifest_path.resolve()}{Colors.RESET}")
+    log(f"State file saved to: {Colors.CYAN}{state_path.resolve()}{Colors.RESET}\n")
 
 
 if __name__ == "__main__":

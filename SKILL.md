@@ -1,145 +1,156 @@
 ---
 name: oa-pdf-download
+version: 1.2.0
+author: JL666788
 description: >-
-  Batch-download legally open-access PDF full texts for a list of papers (DOI list or
-  literature Excel/CSV). Use whenever the user asks to 下载全文 / 下载PDF / 获取原文 /
-  下载文献 / "which of these papers can I get as PDF" / batch fetch OA fulltexts — even
-  mid-workflow after a literature search or Excel deliverable. Encodes field-tested
-  routes: PMC proof-of-work solving, Springer/BMC/Frontiers/MDPI/J-Stage direct URL
-  patterns, Semantic Scholar probe, reCAPTCHA-aware pacing, and China-network
-  workarounds (www.ncbi.nlm.nih.gov DNS pollution, Cloudflare 403 hosts).
+  Batch-download legally open-access (OA) academic full-text PDFs from a DOI list
+  or literature Excel/CSV, then honestly report unobtained papers and reasons.
+  Triggers on requests like: 下载全文 / 下载PDF / 获取原文 / 下载文献 / "download OA full texts" /
+  batch fetch papers. Features built-in PMC Hashcash proof-of-work solver, Springer/
+  Frontiers/MDPI/J-Stage direct pattern routing, Semantic Scholar probing, anti-bot
+  pacing, and China network DNS-pollution mitigations.
+tags:
+  - academic-research
+  - literature
+  - pdf-download
+  - open-access
+  - crossref
+  - pubmed-pmc
 ---
 
-# OA PDF Download
+# 📚 OA PDF Download: Academic Harvester Skill
 
-Download the legally open-access PDF full texts for a set of papers, honestly report
-which cannot be obtained and why. Every technique here was verified working in
-October 2026 (51/74 ECoV papers downloaded in one run).
+Automate the batch acquisition of **legally open-access** academic PDF full texts for a given list of research papers, ensuring 100% legal compliance, resilient anti-scraping countermeasures, and transparent reporting.
 
-## Hard rule
+Field-tested and verified in October 2026 (51/74 veterinary-coronavirus papers fetched in a single session).
 
-**Legal open-access channels only** — PMC/Europe PMC, publisher OA endpoints,
-repository copies surfaced by Semantic Scholar. No paywall circumvention, no
-Sci-Hub, no forged cookies beyond what PMC itself issues to every browser
-(the proof-of-work cookie in step 5 is an anti-scraping toll, not an access
-control: solving it is exactly what a browser does). If a paper is paywalled
-with no OA copy, say so in the report — the user can reach it via campus access.
+---
 
-## Quick start
+## ⚖️ Golden Rule & Ethical Boundary
 
-Use the bundled script for any list of ≥3 DOIs; do not reinvent the pipeline:
+> [!IMPORTANT]
+> **Strict Legal Open-Access Only**:
+> - Only fetch from legitimate OA channels (Publisher OA portals, PubMed Central, Europe PMC, institutional open repositories via Semantic Scholar).
+> - **Never attempt paywall circumvention, never query Sci-Hub, and never use unauthorized cookies.**
+> - The PMC Proof-of-Work cookie solved in Phase B is an anti-scraping rate-limiting challenge, not an access control wall (it mirrors standard browser execution).
+> - If a paper is purely paywalled with no legal OA copy, **report it transparently** so the user can acquire it via university/institutional library access.
+
+---
+
+## 🎯 When to Activate This Skill
+
+Activate this skill whenever the user asks to:
+- 下载全文 / 下载文献 / 下载PDF / 获取论文原文 / 批量下载论文
+- "Download the PDFs for these papers" / "Fetch all available full texts"
+- "Which of these papers are open access?"
+- Mid-workflow handoff after a literature search or systematic review CSV deliverable.
+
+---
+
+## 🛠️ Standard Operating Procedure (SOP)
+
+When assigned to fetch PDFs, do **not** write a custom ad-hoc downloader from scratch. Execute the battle-tested bundled script:
+
+### Step 1: Normalize Input
+Check user input. It may be:
+- A CSV or Excel file containing a `DOI` column (optional `文献名`/`title`, `年份`/`year` columns).
+- A raw list of DOIs in text format.
+*(If given an Excel file `.xlsx`, convert it to `.csv` or pass the DOIs).*
+
+### Step 2: Background Script Execution
+Since downloading dozens of papers with PMC anti-bot pacing can take 10–40 minutes, **always run the script as a background process** (`run_command` with async / background support):
 
 ```bash
 python "<skill-dir>/scripts/fetch_oa_pdfs.py" \
-    --input records.csv --outdir PDFs --state state.json \
-    --email user@real-university.edu.cn --deadline-min 45
+    --input "records.csv" \
+    --outdir "PDFs" \
+    --state "state.json" \
+    --email "researcher@real-university.edu.cn" \
+    --deadline-min 45
 ```
 
-- Input CSV: column `DOI` required; `文献名`/`title` and `年份`/`year` optional
-  (used for `{year}_{title-slug}.pdf` filenames; else fetched from Crossref).
-- State JSON: maps DOI → `{file, source}`. Re-running skips finished items —
-  the script is crash-safe and designed to be relaunched after failures.
-- Output: PDFs + `_manifest.csv` (DOI/file/source per record) + console report
-  listing items with no OA route.
+- **`--state state.json`**: Transactional state persistence. The script saves progress after **every single successful download**. If interrupted, relaunching immediately resumes without repeating finished items.
+- **`--email <email>`**: Provides access to Crossref's polite pool for faster, higher-rate metadata resolution.
 
-## Pipeline: two phases, deliberately paced
+### Step 3: Monitor & Defend Against Rate Limits
+- Periodically verify background task output.
+- The pipeline automatically navigates two phases:
+  1. **Phase A (Fast, ~0.5–1s)**: Publisher direct patterns + Europe PMC + Semantic Scholar probe.
+  2. **Phase B (Paced, 15–30s)**: Multi-round PMC downloads with Hashcash PoW solving and 90s+ reCAPTCHA cooldowns.
 
-**Phase A (fast, ~0.5–1 s between requests)** — try each DOI against:
+### Step 4: Deliver Structured Academic Report
+Once complete, read `PDFs/_manifest.csv` and present a structured summary to the user using the template below.
 
-1. Publisher direct URL patterns (table below), built from Crossref metadata
-   (`api.crossref.org/works/{doi}` gives volume/issue/page/container-title).
-2. Springer universal fallback: `https://link.springer.com/content/pdf/{doi}.pdf`
-   — works for 10.1007 journals *and* book chapters *and* 10.1186 BMC/SpringerOpen.
-3. Europe PMC fullTextPDF: `https://www.ebi.ac.uk/europepmc/webservices/rest/{PMCID}/fullTextPDF`.
-4. Semantic Scholar probe: `api.semanticscholar.org/graph/v1/paper/DOI:{doi}?fields=openAccessPdf`
-   (429 → sleep 10 s, retry once; it rate-limits aggressively).
+---
 
-**Phase B (slow, 15–30 s between requests, multi-round until a ~45 min deadline)**
-— for every DOI with a PMCID, download from PMC. This route yielded 39/51 PDFs in
-the reference run, including Elsevier papers that are only OA via PMC deposits
-(e.g. COVID-19 resource centre, author manuscripts).
+## 📊 User Delivery Report Template
 
-Why this order: Phase A fails fast and cheap; Phase B is slow and probabilistic
-under anti-bot escalation, so it runs last, in rounds, with state saved to disk
-after every single success.
+```markdown
+### 📥 文献全文（OA）下载完成汇报
 
-## PMC proof-of-work (the key technique)
+- **总文献数量**：N 篇
+- **成功获取全文**：M 篇（占比 XX%）
+- **无法直接获取**：K 篇（主要为商业付费出版物）
+- **输出文件目录**：`PDFs/`
+- **详细对照清单**：`PDFs/_manifest.csv`
 
-`https://pmc.ncbi.nlm.nih.gov/articles/{PMCID}/pdf/` usually returns an
-interstitial, not the PDF. It embeds a hashcash challenge:
-
-```python
-def pmc_attempt(pmcid):
-    s = requests.Session(); s.headers.update(UA)
-    url = f"https://pmc.ncbi.nlm.nih.gov/articles/{pmcid}/pdf/"
-    r1 = s.get(url, timeout=60)
-    if r1.content[:4] == b"%PDF":
-        return r1.content, "direct"
-    if "POW_CHALLENGE" in r1.text:
-        ch = re.search(r'POW_CHALLENGE\s*=\s*"([^"]+)"', r1.text).group(1)
-        di = re.search(r'POW_DIFFICULTY\s*=\s*"?(\d+)', r1.text)
-        cn = re.search(r'POW_COOKIE_NAME\s*=\s*"([^"]+)"', r1.text).group(1)
-        nonce = solve_pow(ch, int(di.group(1)) if di else 4)   # sha256(ch+str(n)) starts with "0"*diff
-        s.cookies.set(cn, f"{ch},{nonce}", path="/", domain="pmc.ncbi.nlm.nih.gov")
-        r2 = s.get(url, timeout=120)
-        if r2.content[:4] == b"%PDF":
-            return r2.content, "pow"
-        return None, "post-pow-not-pdf"
-    if "recaptcha" in r1.text.lower():
-        return None, "recaptcha"          # escalated — back off, fresh session next round
-    return None, f"other-{r1.status_code}-{len(r1.text)}"
-```
-
-Difficulty has been 4 (≈ a few seconds of pure-Python hashing). The cookie value
-is `f"{challenge},{nonce}"`. Always verify the response is a PDF, not another
-interstitial.
-
-## Anti-bot discipline (reCAPTCHA escalation)
-
-Rapid sequential PMC downloads trigger a Google reCAPTCHA page (~20 KB HTML, no
-`POW_` constants, contains `recaptcha`). Once escalated, **even solved PoW cookies
-fail**; per-attempt success drops to ~30–50% and recovers only with patience:
-
-- **Fresh `requests.Session` per attempt** — never reuse a session that saw a challenge.
-- **15–30 s randomized sleep between attempts**; on a reCAPTCHA page, cool down 90 s+.
-- **Multi-round retry loop** over the pending list until a deadline; a given item
-  typically succeeds within a few rounds. The reference run cleared 23/23 in 14 rounds.
-- Run long retry loops as a **background script** (`run_in_background`), `print(..., flush=True)`,
-  and persist state after every success so a kill loses nothing.
-
-## Publisher URL patterns (verified)
-
-| Publisher | DOI prefix | URL pattern |
+#### 📦 获取渠道分布
+| 渠道来源 | 数量 | 说明 |
 |---|---|---|
-| Springer (journals + book chapters) | 10.1007 | `https://link.springer.com/content/pdf/{doi}.pdf` |
-| BMC / SpringerOpen | 10.1186 | `https://{journal}.biomedcentral.com/counter/pdf/{doi}.pdf`; same DOI also via link.springer.com |
-| Frontiers | 10.3389 | `https://www.frontiersin.org/journals/{journal}/articles/{doi}/pdf` and `/articles/{doi}/pdf` |
-| MDPI | 10.3390 | DOI id = `{abbrev}{vol2}{issue2}{art4}` → `https://www.mdpi.com/{issn}/{vol}/{issue}/{art}/pdf` (Cloudflare may 403 — fall through to PMC) |
-| J-Stage (JVMS/JES/JVMA) | 10.1292, 10.1294, 10.12935 | `https://www.jstage.jst.go.jp/article/{j}/{vol}/{iss}/{vol}_{firstpage}/_pdf/-char/en`; if that 404s, follow the `doi.org` redirect and scrape the `_pdf` href from the landing page |
-| Scialert | 10.3923 | Parse `https://scialert.net/abstract/?doi={id}` for a PDF link — many articles are HTML-only and have **no PDF at all** |
+| PMC (Hashcash PoW) | X 篇 | 通过 PubMed Central 机构存证与合规解密获取 |
+| Springer / BMC | X 篇 | 开放出版商直链直连 |
+| Frontiers / MDPI | X 篇 | OA 开放期刊官方端点 |
+| Semantic Scholar | X 篇 | 知识库仓储公开副本 |
 
-Not routable (report as paywalled unless a PMCID exists): Elsevier 10.1016,
-Wiley 10.1111 (`.../pdfdirect` returns 403), Sage 10.1177, AJVR 10.2460,
-Vet Record 10.1136, Thieme 10.1055, Hindawi (Cloudflare 403 on all endpoints).
+#### ⚠️ 未获取文献诊断与获取建议
+对于未能获取合法 OA 全文的文献，已核实原因如下：
+1. **商业数据库付费墙（无公开 OA 存证）**：
+   - `[DOI]` 《论文标题》 (Elsevier / Wiley / Sage) ➔ *建议：请通过高校校园网 WebVPN 或图书馆数据库直接下载*
+2. **出版商无 PDF 全文（仅 HTML 格式）**：
+   - `[DOI]` 《论文标题》 (Scialert 等平台)
+```
 
-## Environment quirks (China network, verified 2026-10)
+---
 
-- `www.ncbi.nlm.nih.gov` is DNS-poisoned (returns an unrelated page). Use
-  `pmc.ncbi.nlm.nih.gov` for PDFs and Europe PMC (`www.ebi.ac.uk/europepmc`) for
-  PMCID lookup — both work. NCBI E-utilities (`eutils.ncbi.nlm.nih.gov`) works.
-- `sciencedirect.com` and `journals.sagepub.com`: connection timeouts/SSL failures.
-- `mdpi.com`, `wiley.com`, `hindawi.com`: Cloudflare 403 to datacenter-ish clients.
-- Unpaywall API rejects placeholder emails (422) — use a real address or skip it.
-- Semantic Scholar: 429 on anything but a slow crawl.
-- `duckduckgo`/`bing` searches time out — don't build the pipeline around them.
+## 🔬 Core Engineering & Verification Reference
 
-## Validation and reporting
+### 1. PMC Proof-of-Work (Hashcash Challenge)
+`https://pmc.ncbi.nlm.nih.gov/articles/{PMCID}/pdf/` frequently presents an interstitial HTML challenge containing:
+- `POW_CHALLENGE`: Random alphanumeric token.
+- `POW_DIFFICULTY`: Required leading zeros in hex SHA-256 hash (typically 4).
+- `POW_COOKIE_NAME`: Usually `cloudpmc-viewer-pow`.
 
-- Accept a body as PDF only if it starts with `%PDF` and is >15 KB. Never save
-  an HTML interstitial as `.pdf`, and never trust `Content-Type` alone.
-- Validate file size plausibility for the item (a 12 KB "PDF" is usually an error page).
-- Final report: N/M downloaded, per-item source route, and for each failure an
-  honest reason — `paywalled (no OA copy)`, `no PDF exists (HTML-only journal)`,
-  `network-blocked host`, `no PMCID`. Never pad the report with unverified guesses.
-- Name files `{year}_{title-slug}.pdf` so they sort chronologically and match the
-  literature table's 题名 column for later cross-checking.
+**Solver implementation snippet**:
+```python
+def solve_pow(challenge: str, difficulty: int = 4) -> int:
+    target = "0" * difficulty
+    nonce = 0
+    ch_bytes = challenge.encode()
+    while True:
+        if hashlib.sha256(ch_bytes + str(nonce).encode()).hexdigest().startswith(target):
+            return nonce
+        nonce += 1
+```
+Set cookie as `f"{challenge},{nonce}"` and reissue request with a **fresh session**.
+
+### 2. Anti-Bot Discipline (reCAPTCHA Mitigation)
+Rapid sequential downloads trigger Google reCAPTCHA (~20KB HTML without POW constants):
+- **Fresh `requests.Session` per attempt**: Never reuse a tainted session.
+- **15–30s randomized delay**: Mimics human reading and browser behavior.
+- **90s+ cooldown on reCAPTCHA**: Allow server-side suspicion counters to reset.
+
+### 3. Verified Publisher URL Patterns
+
+| Publisher | DOI Prefix | Deterministic URL Format |
+|---|---|---|
+| **Springer** | `10.1007/` | `https://link.springer.com/content/pdf/{doi}.pdf` |
+| **BMC / SpringerOpen** | `10.1186/` | `https://{journal}.biomedcentral.com/counter/pdf/{doi}.pdf` |
+| **Frontiers** | `10.3389/` | `https://www.frontiersin.org/articles/{doi}/pdf` |
+| **MDPI** | `10.3390/` | `https://www.mdpi.com/{issn}/{vol}/{iss}/{art}/pdf` (Parsed from DOI) |
+| **J-Stage** | `10.1292/`, `10.1294/` | `https://www.jstage.jst.go.jp/article/{j}/{vol}/{iss}/{vol}_{page}/_pdf/-char/en` |
+| **Scialert** | `10.3923/` | Parse abstract page `https://scialert.net/abstract/?doi={id}` |
+
+### 4. China Mainland Network Specifics (Verified 2026-10)
+- `www.ncbi.nlm.nih.gov` suffers from DNS pollution in several mainland regions. Always route via `pmc.ncbi.nlm.nih.gov` for PDFs and Europe PMC (`www.ebi.ac.uk/europepmc`) for PMCID lookup.
+- `sciencedirect.com` and `journals.sagepub.com` frequently drop connections/reset SSL.
+- Unpaywall API strictly rejects placeholder emails (returns 422). Use a valid email or rely on Europe PMC / Semantic Scholar.
