@@ -28,6 +28,7 @@ INCLUDE_FILES = [
     "LICENSE",
     "requirements.txt",
     "manifest.json",
+    "icon.png",
     "examples/sample_papers.csv",
     "references/publisher-routes.md",
     "references/anti-bot-and-network.md",

@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="icon.png" width="128" height="128" alt="OA-PDF-Download Logo" style="border-radius: 28px; box-shadow: 0 10px 25px rgba(0,0,0,0.2);" />
+
 # 📄 OA-PDF-Download
 
 **面向学术科研与 AI Agent 的高可靠合法开源学术论文（Open Access）批量下载工具**
