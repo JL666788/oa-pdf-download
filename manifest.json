@@ -1,0 +1,36 @@
+{
+  "id": "oa-pdf-download",
+  "name": "OA论文全文批量下载",
+  "version": "1.2.0",
+  "description": "批量合法合规下载开放获取(Open Access)学术论文PDF全文。内置PMC Hashcash PoW挑战求解器，自动适配Springer/Frontiers/MDPI/J-Stage/Europe PMC等渠道，支持事务级断点续传与透明化学术清单导出。",
+  "type": "skill",
+  "author": "JL666788",
+  "homepage": "https://github.com/JL666788/oa-pdf-download",
+  "entry": "SKILL.md",
+  "icon": "📄",
+  "tags": [
+    "学术科研",
+    "文献检索",
+    "论文下载",
+    "PDF处理",
+    "开放获取",
+    "PubMed"
+  ],
+  "triggers": [
+    "下载文献",
+    "下载论文",
+    "下载全文",
+    "下载PDF",
+    "获取原文",
+    "批量下载文献",
+    "OA文献下载",
+    "下载这些论文的PDF"
+  ],
+  "dependencies": {
+    "python": ">=3.10",
+    "pip": [
+      "requests>=2.28.0",
+      "urllib3>=1.26.0"
+    ]
+  }
+}
