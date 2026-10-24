@@ -6,6 +6,7 @@ __pycache__/
 # Output directories & files
 PDFs/
 *.pdf
+*.zip
 state.json
 _manifest.csv
 *.log
