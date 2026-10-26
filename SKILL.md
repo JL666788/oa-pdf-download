@@ -75,10 +75,14 @@ python scripts/fetch_oa_pdfs.py --test
 ### 第二步：观察控制台输出与执行状态
 
 脚本执行时会自动：
-1. **Phase A（秒级快筛）**：优先请求 Springer / BMC / Frontiers / MDPI / J-Stage / Europe PMC 等出版商直链。
-2. **Phase B（PMC 深度突破）**：对有 PMCID 的文献求解 Hashcash PoW 挑战。
-3. **安全落盘**：每成功下载一篇即原子落盘保存至 `PDFs/{year}_{title-slug}.pdf`，并更新 `state.json`。
-4. **生成清单**：在输出目录生成 `_manifest.csv`。
+1. **Phase A（秒级快筛）**：优先请求 Springer / BMC / Frontiers / **MDPI 自有 CDN（mdpi-res.com，绕 WAF）** / J-Stage 等出版商直链。
+2. **OA 全量定位**：并发查 **Unpaywall → OpenAlex**，这两个 API 不在出版商 WAF 之后，能拿到被主站拦截的 PDF 直链。
+3. **Phase B（PMC 深度突破）**：对有 PMCID 的文献求解 Hashcash PoW 挑战（若本机 NCBI 不可达，请加 `--skip-pmc`）。
+4. **全文兜底**：PDF 全部失败时降级保存 Europe PMC JATS 全文 `.xml`，并明确标注格式，**不冒充 PDF**（可用 `--no-xml-fallback` 关闭）。
+5. **安全落盘**：每成功下载一篇即原子落盘保存，并更新 `state.json`。
+6. **生成清单**：在输出目录生成 `_manifest.csv`，摘要中分别统计「PDF obtained / XML only / Any full text」。
+
+> 💡 **排障要点**：若多个不同出版商同时返回 403，是**出口 IP 信誉**问题（非代理未生效）。用 `--verbose` 逐渠道查看状态码，然后更换出口节点，不要反复重试。
 
 ---
 

@@ -37,8 +37,10 @@
 - 🧩 **独家 PMC Hashcash Proof-of-Work (PoW) 自动应答**
   - 针对 `pmc.ncbi.nlm.nih.gov` 设置的浏览器防爬 Hashcash 挑战（4 难度 SHA-256 碰撞），内置纯 Python 高速算力求解器，自动生成 `cloudpmc-viewer-pow` 验证通行证。
 - ⚡ **双阶段智能调度管道 (Two-Phase Pipeline)**
-  - **Phase A (快筛阶段)**：秒级扫描 Springer, BMC, Frontiers, MDPI, J-Stage, Europe PMC 与 Semantic Scholar。
+  - **Phase A (快筛阶段)**：秒级扫描 Springer, BMC, Frontiers, MDPI, J-Stage，再叠加 **Unpaywall → OpenAlex** 全量 OA 定位，最后以 Semantic Scholar 与 Europe PMC JATS 全文兜底。
   - **Phase B (精打阶段)**：多轮随机间隔（15–30s）退避调度 PMC，智能监测 reCAPTCHA 升级风险并自动触发 90s+ 冷却机制。
+- 🔗 **出版商自有 CDN 优先策略**
+  - MDPI 等平台的主站常挂在 Akamai / Cloudflare 之后，机房或代理 IP 极易被判 403；脚本优先走其自有静态 CDN（如 `mdpi-res.com`），**绕过 WAF 边缘拦截**，实测同一篇论文主站 403、CDN 却是 200 / 21 MB 正常 PDF。
 - 🇨🇳 **深度适配国内学术网络环境**
   - 彻底规避 `www.ncbi.nlm.nih.gov` 在国内部分网络下的 DNS 污染异常，重定向至高可用的 `pmc.ncbi.nlm.nih.gov` 与 Europe PMC API。
   - 优雅处理 Cloudflare 403 阻断，自动降级至稳定仓储镜像。
@@ -60,9 +62,10 @@ flowchart TD
     LoadState --> PhaseA["⚡ Phase A: 快速直链嗅探 (~0.5s)"]
     
     subgraph PhaseA_Detail ["Phase A 渠道快筛"]
-        PA1["Crossref 元数据解析"] --> PA2["出版商直接规则 (Springer / BMC / Frontiers / MDPI / J-Stage)"]
-        PA2 --> PA3["Europe PMC fullTextPDF 尝试"]
-        PA3 --> PA4["Semantic Scholar openAccessPdf 探测"]
+        PA1["Crossref 元数据解析"] --> PA2["出版商直接规则 (Springer / BMC / Frontiers / MDPI-CDN / J-Stage)"]
+        PA2 --> PA3["Unpaywall → OpenAlex 全量 OA 定位"]
+        PA3 --> PA4["Europe PMC fullTextXML / Semantic Scholar 兜底"]
+        PA4 --> PA5["无 PDF 时降级保存 JATS XML（如实标注格式）"]
     end
     PhaseA --> PhaseA_Detail
     PhaseA_Detail --> CheckA{"是否成功获取?"}
@@ -97,11 +100,13 @@ flowchart TD
 | **Springer** | `10.1007` | 通用直链 `link.springer.com/content/pdf/{doi}.pdf` | ✅ 完全支持 |
 | **BioMed Central (BMC)** | `10.1186` | BMC 计数器端点及 Springer 回退端点 | ✅ 完全支持 |
 | **Frontiers** | `10.3389` | 官方文章直链与期刊专栏 PDF 模式 | ✅ 完全支持 |
-| **MDPI** | `10.3390` | 根据 DOI 解析卷期号，自动映射标准 ISSN 直连 | ✅ 完全支持 |
+| **MDPI** | `10.3390` | **优先走自有 CDN `mdpi-res.com`**（文件名规则 `{刊}-{卷}-{文章号补零5位}`），主站 ISSN 直连作为备选 | ✅ 完全支持 |
 | **J-Stage** | `10.1292`, `10.1294` 等 | 卷期页码结构化直链；支持 Landing Page 解析兜底 | ✅ 完全支持 |
 | **NCBI PMC** | 任意带 PMCID 论文 | 求解 Hashcash PoW Cookie 挑战（含 Elsevier 存证） | ✅ 独家支持 |
-| **Europe PMC** | 任意带 PMCID 论文 | EBI Europe PMC 开放 RESTful fullTextPDF 端点 | ✅ 完全支持 |
-| **Semantic Scholar** | 任意 DOI | 调用 S2 Graph API 检索机构知识库与预印本合法公开源 | ✅ 完全支持 |
+| **Unpaywall** | 任意 DOI | `api.unpaywall.org` 返回 `best_oa_location.url_for_pdf`，**API 不在出版商 WAF 之后** | ✅ 完全支持 |
+| **OpenAlex** | 任意 DOI | `api.openalex.org` 遍历全部 `locations[].pdf_url` | ✅ 完全支持 |
+| **Europe PMC** | 任意带 PMCID 论文 | `rest/{PMCID}/fullTextXML` 取 JATS 全文（PDF 端点已废弃，不再尝试） | ✅ 全文XML |
+| **Semantic Scholar** | 任意 DOI | 调用 S2 Graph API 检索机构知识库与预印本合法公开源（共享 IP 易 429） | ⚠️ 限流 |
 | **Scialert** | `10.3923` | 解析 Abstract 提取附件（部分文献仅有 HTML 无 PDF） | ⚠️ 尽力支持 |
 | **Elsevier / Wiley / Sage** | `10.1016`, `10.1111` 等 | **非 OA 付费墙期刊**；若论文已存入 PMC 则可下，否则明确报告 | ℹ️ 仅限已存入OA |
 
@@ -226,6 +231,7 @@ State file saved to: /workspace/state.json
 | `--email` | - | 否 | `""` | 真实联系邮箱，用于触发 Crossref Polite 优待池 |
 | `--skip-pmc` | - | 否 | `False` | 跳过 Phase B（仅执行 Phase A 快速扫描） |
 | `--verbose` | `-v` | 否 | `False` | 输出更详细的网络探测与 HTTP 调试信息 |
+| `--no-xml-fallback` | - | 否 | `False` | 禁止在拿不到 PDF 时降级保存 Europe PMC JATS 全文 XML |
 | `--no-color` | - | 否 | `False` | 禁用终端 ANSI 彩色转义序列 |
 
 ---
@@ -250,6 +256,26 @@ State file saved to: /workspace/state.json
 工具内部已主动回避了受污染的 <code>www.ncbi.nlm.nih.gov</code>，转而采用 <code>pmc.ncbi.nlm.nih.gov</code> 以及欧洲生物信息研究所的 Europe PMC 镜像。如果您的局域网环境对境外学术服务器限制较严格，可配置标准环境变量代理：
 <pre><code>export HTTP_PROXY="http://127.0.0.1:7890"
 export HTTPS_PROXY="http://127.0.0.1:7890"</code></pre>
+</details>
+
+<details>
+<summary><b>Q4: 明明挂了代理、ChatGPT 也能用，为什么下载全返回 403？</b></summary>
+<br>
+这不是代理没生效，而是<b>出口 IP 的信誉问题</b>。很多机房/机场 IP 被 Cloudflare、Akamai 集中标记，表现为：
+<ul>
+<li>Wiley / APS / Cell / Elsevier / <code>europepmc.org</code> → 统一返回 <b>403</b> 与约 5.8 KB 的挑战页；</li>
+<li>MDPI 主站 → <b>403 Access Denied</b>（但自有 CDN <code>mdpi-res.com</code> 仍可 200）；</li>
+<li>NCBI 全部子域（<code>pmc</code> / <code>www</code> / <code>eutils</code> / <code>ftp</code>）→ TLS 握手直接被断开。</li>
+</ul>
+排查方法：先用 <code>--verbose</code> 看每个渠道的状态码。若多个不同出版商同时 403，基本可判定为 IP 被封，请<b>更换出口节点</b>（优先住宅 IP 或换一家机场），而非反复重试。
+<br><br>
+另外注意：使用 TUN 模式（如 FlClash 的 <code>global</code> + TUN）时，<b>所有流量都被系统级接管</b>，此时 <code>curl --noproxy</code> 与 <code>-x 127.0.0.1:7890</code> 的出口 IP 必然相同——不能据此判断「代理没生效」。
+</details>
+
+<details>
+<summary><b>Q5: 为什么有时保存的是 .xml 而不是 .pdf？</b></summary>
+<br>
+当所有合法 PDF 通道都不可用时，脚本会降级保存 Europe PMC 的 JATS 全文 XML（含完整正文与参考文献），<b>文件名后缀为 <code>.xml</code> 并明确标注「全文XML非PDF」</b>，绝不会把 XML 或 HTML 拦截页冒充成 PDF。若不需要此兜底行为，加 <code>--no-xml-fallback</code>。
 </details>
 
 ---

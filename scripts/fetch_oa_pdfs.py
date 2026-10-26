@@ -45,6 +45,13 @@ except ImportError:
 
 
 # ==============================================================================
+# Global runtime flags
+# ==============================================================================
+
+VERBOSE = False
+
+
+# ==============================================================================
 # UI & Output Formatting
 # ==============================================================================
 
@@ -253,11 +260,20 @@ def generate_publisher_urls(doi: str, meta: dict) -> List[Tuple[str, str]]:
         _add(f"https://www.frontiersin.org/journals/*/articles/{doi}/pdf", "frontiers-j")
 
     # 3. MDPI
+    #    注意：www.mdpi.com 位于 Akamai 之后，对多数机房/代理 IP 返回 403。
+    #    mdpi-res.com 是 MDPI 自有静态 CDN，通常不经过 WAF，优先尝试。
     if doi.startswith("10.3390/"):
         jid = doi.split("/")[1]
         m = re.match(r"^([a-z]+)(\d{2})(\d{2})(\d{4})$", jid)
         if m:
             ab, vol, iss, art = m.groups()
+            # 文件名规则：{期刊}-{卷}-{文章号补零5位}，注意与 DOI 里的 4 位不同
+            base = f"{ab}-{int(vol)}-{int(art):05d}"
+            _add(
+                f"https://mdpi-res.com/d_attachment/{ab}/{base}/article_deploy/{base}.pdf",
+                "mdpi-cdn",
+            )
+            # 3b. 主站（可能被 WAF 拦截，作为备选）
             issn = MDPI_ISSN_MAP.get(ab)
             if issn:
                 _add(f"https://www.mdpi.com/{issn}/{int(vol)}/{int(iss)}/{int(art)}/pdf", "mdpi")
@@ -277,6 +293,51 @@ def generate_publisher_urls(doi: str, meta: dict) -> List[Tuple[str, str]]:
     return urls
 
 
+def resolve_oa_pdf_urls(doi: str, email: str = "") -> List[Tuple[str, str]]:
+    """Resolve open-access PDF links via Unpaywall and OpenAlex.
+
+    These two APIs are not behind publisher WAFs and usually reachable even when
+    the publisher landing site itself is blocked. They don't host the file
+    themselves, but they tell us every known OA location to try.
+    """
+    urls: List[Tuple[str, str]] = []
+
+    def _add(u: str, tag: str):
+        if not u:
+            return
+        if u.lower().endswith((".pdf", "/pdf")) or "/pdf" in u.lower() or "pdfdirect" in u.lower():
+            if (u, tag) not in urls:
+                urls.append((u, tag))
+
+    contact = email or "anonymous@example.com"
+
+    # --- Unpaywall ---
+    res = http_get(f"https://api.unpaywall.org/v2/{doi}", params={"email": contact}, timeout=25)
+    if res and res.ok:
+        try:
+            data = res.json()
+            best = data.get("best_oa_location") or {}
+            _add(best.get("url_for_pdf") or "", "unpaywall-best")
+            for loc in data.get("oa_locations") or []:
+                _add(loc.get("url_for_pdf") or "", "unpaywall-oa")
+        except Exception:
+            pass
+
+    # --- OpenAlex ---
+    res = http_get(f"https://api.openalex.org/works/doi:{doi}", timeout=25)
+    if res and res.ok:
+        try:
+            data = res.json()
+            for loc in ((data.get("best_oa_location") or {}),):
+                _add(loc.get("pdf_url") or "", "openalex-best")
+            for loc in data.get("locations") or []:
+                _add(loc.get("pdf_url") or "", "openalex-loc")
+        except Exception:
+            pass
+
+    return urls[:6]
+
+
 def scrape_jstage_landing_page(doi: str) -> List[str]:
     """Scrape the landing page on J-Stage following doi.org redirection."""
     res = http_get(f"https://doi.org/{doi}", timeout=30)
@@ -290,9 +351,22 @@ def scrape_jstage_landing_page(doi: str) -> List[str]:
         return []
 
 
-def download_url(url: str, timeout: int = 40) -> Optional[bytes]:
+def download_url(url: str, timeout: int = 40, tag: str = "") -> Optional[bytes]:
     """Download content from URL and validate PDF format."""
     res = http_get(url, timeout=timeout)
+    if VERBOSE:
+        label = tag or url[:60]
+        if res is None:
+            print(f"      [verbose] {label}: 连接失败/无响应")
+        else:
+            ctype = ""
+            if getattr(res, "headers", None):
+                ctype = (res.headers.get("Content-Type") or res.headers.get("content-type") or "")
+            verdict = "PDF-OK" if is_valid_pdf(res.content) else "非PDF"
+            print(
+                f"      [verbose] {label}: HTTP {res.status_code} "
+                f"| {ctype[:32] or '-'} | {len(res.content)}B | {verdict}"
+            )
     if res and res.ok and is_valid_pdf(res.content):
         return res.content
     return None
@@ -457,7 +531,14 @@ def main():
     parser.add_argument("--skip-pmc", action="store_true", help="Skip Phase B (fast scan only)")
     parser.add_argument("--test", action="store_true", help="Run quick environment health check and exit 0")
     parser.add_argument("--no-color", action="store_true", help="Disable ANSI terminal colors")
+    parser.add_argument("--verbose", "-v", action="store_true",
+                        help="Print every HTTP status code / content-type / size for each attempt")
+    parser.add_argument("--no-xml-fallback", action="store_true",
+                        help="Do not save Europe PMC JATS XML when no PDF is obtainable")
     args = parser.parse_args()
+
+    global VERBOSE
+    VERBOSE = bool(args.verbose)
 
     if args.no_color:
         Colors.disable()
@@ -523,6 +604,23 @@ def main():
         kb = len(content) // 1024
         log(f"  {Colors.GREEN}[✓] Saved ({kb} KB):{Colors.RESET} {filename} {Colors.DIM}(via {source}){Colors.RESET}")
 
+    def store_raw(doi: str, content: bytes, source: str, ext: str):
+        """Save non-PDF fallback (e.g. JATS XML full text) without pretending it is a PDF."""
+        rec = recs_map[doi]
+        year_str = rec.year or "nd"
+        slug_str = slugify(rec.title or doi)
+        filename = f"{year_str}_{slug_str}.{ext}"
+        filepath = outdir / filename
+        filepath.write_bytes(content)
+        state[doi] = {"file": filename, "source": source, "format": ext}
+        save_state(state_path, state)
+        kb = len(content) // 1024
+        log(
+            f"  {Colors.YELLOW}[~] Saved as .{ext} ({kb} KB):{Colors.RESET} {filename} "
+            f"{Colors.DIM}(via {source}, 全文XML非PDF){Colors.RESET}"
+        )
+
+
     deadline = time.time() + args.deadline_min * 60
     pmcids: Dict[str, Optional[str]] = {}
 
@@ -554,7 +652,7 @@ def main():
 
         # 1. Publisher Direct Patterns
         for url, tag in generate_publisher_urls(doi, meta):
-            content = download_url(url)
+            content = download_url(url, tag=tag)
             if content:
                 store_pdf(doi, content, tag)
                 downloaded = True
@@ -575,14 +673,33 @@ def main():
             todo.remove(doi)
             continue
 
-        # 3. Europe PMC direct fullTextPDF probe
+        # 3. Unpaywall -> OpenAlex -> Europe PMC 全文链路
+        for oa_url, oa_tag in resolve_oa_pdf_urls(doi, args.email):
+            content = download_url(oa_url, tag=oa_tag)
+            if content:
+                store_pdf(doi, content, oa_tag)
+                todo.remove(doi)
+                downloaded = True
+                break
+            time.sleep(0.3)
+        if downloaded:
+            continue
+
+        # 4. Europe PMC JATS 全文 XML 兜底（PDF 拿不到时保留可读全文，如实标注格式）
         if doi not in pmcids:
             pmcids[doi] = query_europe_pmc_pmcid(doi)
-        if pmcids.get(doi):
-            epmc_url = f"https://www.ebi.ac.uk/europepmc/webservices/rest/{pmcids[doi]}/fullTextPDF"
-            content = download_url(epmc_url)
-            if content:
-                store_pdf(doi, content, "europepmc-rest")
+        pmcid = pmcids.get(doi)
+        if pmcid and not args.no_xml_fallback:
+            xml_url = f"https://www.ebi.ac.uk/europepmc/webservices/rest/{pmcid}/fullTextXML"
+            res_xml = http_get(xml_url, timeout=40)
+            if VERBOSE:
+                print(
+                    f"      [verbose] epmc-xml: HTTP "
+                    f"{res_xml.status_code if res_xml else 'ERR'} "
+                    f"| {len(res_xml.content) if res_xml else 0}B"
+                )
+            if res_xml and res_xml.ok and res_xml.content[:5] == b"<?xml":
+                store_raw(doi, res_xml.content, "europepmc-fullTextXML", "xml")
                 todo.remove(doi)
                 continue
 
@@ -679,7 +796,20 @@ def main():
     print(f"{Colors.BOLD}{Colors.GREEN}  DOWNLOAD HARVEST SUMMARY{Colors.RESET}")
     print(f"{Colors.BOLD}{Colors.GREEN}{'='*60}{Colors.RESET}")
     log(f"Total Papers: {Colors.BOLD}{total}{Colors.RESET}")
-    log(f"Successfully Harvested: {Colors.GREEN}{Colors.BOLD}{len(success_dois)}/{total} "
+
+    pdf_count = sum(
+        1 for d in success_dois if str(state.get(d, {}).get("format", "pdf")).lower() == "pdf"
+    )
+    xml_count = sum(
+        1 for d in success_dois if str(state.get(d, {}).get("format", "pdf")).lower() != "pdf"
+    )
+    log(f"PDF obtained:  {Colors.GREEN}{Colors.BOLD}{pdf_count}/{total} "
+        f"({(pdf_count/total*100):.1f}%){Colors.RESET}")
+    if xml_count:
+        log(f"XML only:      {Colors.YELLOW}{Colors.BOLD}{xml_count}/{total} "
+            f"({(xml_count/total*100):.1f}%){Colors.RESET} "
+            f"{Colors.DIM}(JATS 全文，非 PDF){Colors.RESET}")
+    log(f"Any full text: {Colors.BOLD}{len(success_dois)}/{total} "
         f"({(len(success_dois)/total*100):.1f}%){Colors.RESET}")
 
     if todo:
