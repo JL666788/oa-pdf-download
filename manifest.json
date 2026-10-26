@@ -1,8 +1,8 @@
 {
   "id": "oa-pdf-download",
   "name": "OA论文全文批量下载",
-  "version": "1.2.0",
-  "description": "批量合法合规下载开放获取(Open Access)学术论文PDF全文。内置PMC Hashcash PoW挑战求解器，自动适配Springer/Frontiers/MDPI/J-Stage/Europe PMC等渠道，支持事务级断点续传与透明化学术清单导出。",
+  "version": "1.2.1",
+  "description": "批量合法合规下载开放获取(Open Access)学术论文PDF全文。支持单个DOI、多个DOI或文献表格输入，内置PMC Hashcash PoW挑战求解器，自动适配Springer/Frontiers/MDPI/J-Stage/Europe PMC等渠道，支持事务级断点续传与透明化学术清单导出。",
   "type": "skill",
   "author": "JL666788",
   "homepage": "https://github.com/JL666788/oa-pdf-download",
