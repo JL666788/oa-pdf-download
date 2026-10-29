@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import html
 import json
 import os
 import random
@@ -114,6 +115,27 @@ def is_valid_pdf(content: bytes) -> bool:
     return len(content) > 15_000 and content[:5].startswith(b"%PDF")
 
 
+def safe_title(text: str, max_len: int = 190) -> str:
+    """Turn an article title into a readable, Windows-safe filename stem.
+
+    Differs from slugify() in that it keeps the human-readable wording, strips
+    JATS/HTML inline tags (``<scp>``, ``<i>`` ...), replaces characters that are
+    illegal on Windows and truncates on a WORD BOUNDARY so that names never end
+    in the middle of a word (a hard cut produced stems like ``...inflammato``).
+    """
+    t = re.sub(r"<[^>]+>", "", text)                      # JATS / HTML inline tags
+    t = html.unescape(t)
+    t = t.replace("\u2010", "-").replace("\u2011", "-")   # non-breaking hyphens
+    t = t.replace("\u201c", '"').replace("\u201d", '"')
+    t = re.sub(r'[\\/:*?"<>|]', "-", t)                   # illegal on Windows
+    t = re.sub(r"\s+", " ", t).strip()
+    t = t.rstrip(". ")                                    # trailing dots/spaces illegal
+    if len(t) > max_len:
+        cut = t[:max_len].rsplit(" ", 1)[0].rstrip(" ,;:-")
+        t = cut or t[:max_len]
+    return t or "untitled"
+
+
 # ==============================================================================
 # Constants & Unified HTTP Abstraction
 # ==============================================================================
@@ -159,8 +181,13 @@ class HttpResponse:
         return json.loads(self.text)
 
 
+LAST_HTTP_ERROR = ""
+
+
 def http_get(url: str, params: dict = None, headers: dict = None, timeout: int = 30) -> Optional[HttpResponse]:
     """Unified HTTP GET wrapper supporting both requests and standard library urllib."""
+    global LAST_HTTP_ERROR
+    LAST_HTTP_ERROR = ""
     h = dict(DEFAULT_HEADERS)
     if headers:
         h.update(headers)
@@ -170,7 +197,8 @@ def http_get(url: str, params: dict = None, headers: dict = None, timeout: int =
         try:
             r = requests.get(url, params=params, headers=h, timeout=timeout, allow_redirects=True)
             return HttpResponse(r.status_code, r.content, r.text, dict(r.headers))
-        except Exception:
+        except Exception as e:
+            LAST_HTTP_ERROR = f"{type(e).__name__}: {str(e)[:160]}"
             return None
 
     # 2. Standard library fallback (zero-dependency)
@@ -189,7 +217,11 @@ def http_get(url: str, params: dict = None, headers: dict = None, timeout: int =
     except urllib.error.HTTPError as e:
         content = e.read() if hasattr(e, "read") else b""
         return HttpResponse(e.code, content, content.decode("utf-8", errors="replace"), dict(e.headers))
-    except Exception:
+    except Exception as e:
+        # Keep the reason (SSL reset vs DNS vs timeout) - a bare "connect-err"
+        # tells the user nothing and made network faults indistinguishable from
+        # genuinely paywalled papers during real-world debugging.
+        LAST_HTTP_ERROR = f"{type(e).__name__}: {str(e)[:160]}"
         return None
 
 
@@ -387,62 +419,74 @@ def solve_pmc_hashcash(challenge: str, difficulty: int = 4) -> int:
         nonce += 1
 
 
-def attempt_pmc_download(pmcid: str) -> Tuple[Optional[bytes], str]:
-    """Attempt PMC PDF retrieval with automatic PoW solver."""
+PMC_RECAPTCHA_MARKERS = ("recaptcha", "checking your browser")
+PMC_TRANSIENT_RETRIES = 3
+
+
+def _classify_pmc_response(res: Optional[HttpResponse]) -> str:
+    """Map a PMC response onto a coarse outcome used for retry decisions."""
+    if res is None:
+        return "connect-err"
+    if is_valid_pdf(res.content):
+        return "pdf"
+    body = res.text or ""
+    if "POW_CHALLENGE" in body:
+        return "pow"
+    if any(m in body.lower() for m in PMC_RECAPTCHA_MARKERS):
+        return "recaptcha"
+    return f"status-{res.status_code}"
+
+
+def attempt_pmc_download(pmcid: str, retries: int = PMC_TRANSIENT_RETRIES) -> Tuple[Optional[bytes], str]:
+    """Attempt PMC PDF retrieval with automatic PoW solver.
+
+    Retries inside a single call matter more than they look: PMC very often drops
+    the PDF body with ``SSL: UNEXPECTED_EOF_WHILE_READING`` (or returns an empty
+    body) on the first try and serves the file fine on the second or third.
+    Treating that as "unobtainable" produced false negatives in testing.
+
+    A reCAPTCHA interstitial is NOT retried here - hammering it only deepens the
+    rate-limit. It is surfaced to the caller so that Phase B can cool down.
+    """
     url = f"https://pmc.ncbi.nlm.nih.gov/articles/{pmcid}/pdf/"
+    cookie = None
+    last_note = "connect-err"
 
-    if HAS_REQUESTS:
-        s = requests.Session()
-        s.headers.update(DEFAULT_HEADERS)
-        try:
-            r1 = s.get(url, timeout=40)
-            if is_valid_pdf(r1.content):
-                return r1.content, "direct"
-            if "POW_CHALLENGE" in r1.text:
-                ch = re.search(r'POW_CHALLENGE\s*=\s*"([^"]+)"', r1.text).group(1)
-                di_match = re.search(r'POW_DIFFICULTY\s*=\s*"?(\d+)', r1.text)
-                di = int(di_match.group(1)) if di_match else 4
-                cn_match = re.search(r'POW_COOKIE_NAME\s*=\s*"([^"]+)"', r1.text)
-                cn = cn_match.group(1) if cn_match else "cloudpmc-viewer-pow"
+    for attempt in range(1, retries + 1):
+        headers = {"Cookie": cookie} if cookie else None
+        res = http_get(url, headers=headers, timeout=60)
+        kind = _classify_pmc_response(res)
 
-                nonce = solve_pmc_hashcash(ch, di)
-                s.cookies.set(cn, f"{ch},{nonce}", path="/", domain="pmc.ncbi.nlm.nih.gov")
-                r2 = s.get(url, timeout=60)
-                if is_valid_pdf(r2.content):
-                    return r2.content, "pow-solved"
-                return None, "post-pow-not-pdf"
-            if "recaptcha" in r1.text.lower():
-                return None, "recaptcha"
-            return None, f"status-{r1.status_code}"
-        except Exception as e:
-            return None, f"err:{type(e).__name__}"
-    else:
-        # Standard library route
-        r1 = http_get(url, timeout=40)
-        if not r1:
-            return None, "connect-err"
-        if is_valid_pdf(r1.content):
-            return r1.content, "direct"
-        if "POW_CHALLENGE" in r1.text:
+        if kind == "pdf":
+            return res.content, ("pow-solved" if cookie else "direct")
+
+        if kind == "pow":
+            body = res.text or ""
             try:
-                ch = re.search(r'POW_CHALLENGE\s*=\s*"([^"]+)"', r1.text).group(1)
-                di_match = re.search(r'POW_DIFFICULTY\s*=\s*"?(\d+)', r1.text)
+                ch = re.search(r'POW_CHALLENGE\s*=\s*"([^"]+)"', body).group(1)
+                di_match = re.search(r'POW_DIFFICULTY\s*=\s*"?(\d+)', body)
                 di = int(di_match.group(1)) if di_match else 4
-                cn_match = re.search(r'POW_COOKIE_NAME\s*=\s*"([^"]+)"', r1.text)
+                cn_match = re.search(r'POW_COOKIE_NAME\s*=\s*"([^"]+)"', body)
                 cn = cn_match.group(1) if cn_match else "cloudpmc-viewer-pow"
-
                 nonce = solve_pmc_hashcash(ch, di)
-                headers = dict(DEFAULT_HEADERS)
-                headers["Cookie"] = f"{cn}={ch},{nonce}"
-                r2 = http_get(url, headers=headers, timeout=60)
-                if r2 and is_valid_pdf(r2.content):
-                    return r2.content, "pow-solved"
-                return None, "post-pow-not-pdf"
+                cookie = f"{cn}={ch},{nonce}"
+                if VERBOSE:
+                    print(f"      [verbose] pmc-pow: difficulty={di} nonce={nonce}")
             except Exception as e:
                 return None, f"pow-err:{type(e).__name__}"
-        if "recaptcha" in r1.text.lower():
+            continue
+
+        if kind == "recaptcha":
             return None, "recaptcha"
-        return None, f"status-{r1.status_code}"
+
+        last_note = kind
+        if VERBOSE:
+            detail = f" ({LAST_HTTP_ERROR})" if kind == "connect-err" and LAST_HTTP_ERROR else ""
+            print(f"      [verbose] pmc-attempt {attempt}: {kind}{detail}")
+        if attempt < retries:
+            time.sleep(3 * attempt)
+
+    return None, last_note
 
 
 # ==============================================================================
@@ -516,6 +560,91 @@ def save_state(path: Path, state: dict):
 # Main Orchestrator
 # ==============================================================================
 
+def run_doctor(email: str = "") -> None:
+    """Probe every upstream the harvester depends on and explain what is broken.
+
+    Motivation: when a whole batch fails it is almost never the parser - it is
+    the network path (proxy node blacklisted by Cloudflare / NCBI). Without this
+    check the only symptom is "0/N downloaded", which looks like a code bug.
+    """
+    sample_doi = "10.1073/pnas.120069197"
+    sample_pmcid = "PMC18768"
+    targets = [
+        ("Crossref metadata", f"https://api.crossref.org/works/{sample_doi}", "metadata"),
+        (
+            "Unpaywall",
+            f"https://api.unpaywall.org/v2/{sample_doi}?email={email or 'test@example.com'}",
+            "metadata",
+        ),
+        ("OpenAlex", f"https://api.openalex.org/works/doi:{sample_doi}", "metadata"),
+        (
+            "Europe PMC (JATS XML)",
+            f"https://www.ebi.ac.uk/europepmc/webservices/rest/{sample_pmcid}/fullTextXML",
+            "fallback",
+        ),
+        ("PMC (PDF, PoW)", f"https://pmc.ncbi.nlm.nih.gov/articles/{sample_pmcid}/pdf/", "pdf"),
+        (
+            "MDPI CDN",
+            "https://mdpi-res.com/d_attachment/ijms/ijms-25-00748/article_deploy/ijms-25-00748.pdf",
+            "pdf",
+        ),
+        ("Wiley", "https://onlinelibrary.wiley.com/", "pdf"),
+        ("Cell Press", "https://www.cell.com/", "pdf"),
+    ]
+
+    print(f"\n{Colors.BOLD}{Colors.CYAN}{'='*66}{Colors.RESET}")
+    print(f"{Colors.BOLD}{Colors.CYAN}  OA-PDF-Download: Environment Doctor{Colors.RESET}")
+    print(f"{Colors.BOLD}{Colors.CYAN}{'='*66}{Colors.RESET}")
+
+    results = []
+    retryable = (429, 500, 502, 503, 504)
+    for name, url, kind in targets:
+        res = None
+        for attempt in range(3):
+            res = http_get(url, timeout=25)
+            if res is not None and res.status_code not in retryable:
+                break
+            time.sleep(2 + 2 * attempt)
+
+        if res is None:
+            verdict, note = "unreachable", LAST_HTTP_ERROR
+        elif is_valid_pdf(res.content):
+            verdict, note = "ok", f"real PDF, {len(res.content) // 1024} KB"
+        elif res.ok and "POW_CHALLENGE" in (res.text or ""):
+            verdict, note = "ok", "PoW challenge page (expected)"
+        elif res.ok:
+            verdict, note = "ok", f"{len(res.content)}B"
+        elif res.status_code == 403:
+            verdict, note = "blocked", "403 (WAF / IP reputation)"
+        elif res.status_code == 429:
+            verdict, note = "throttled", "429 (rate limited, retry later)"
+        else:
+            verdict, note = "error", f"HTTP {res.status_code}"
+        results.append((name, kind, verdict, note))
+        color = {"ok": Colors.GREEN, "blocked": Colors.YELLOW, "throttled": Colors.YELLOW}.get(verdict, Colors.RED)
+        print(f"  {name:22s} {color}{verdict:12s}{Colors.RESET} {Colors.DIM}{note[:48]}{Colors.RESET}")
+
+    meta_ok = any(v == "ok" for _, k, v, _ in results if k == "metadata")
+    pmc_ok = any(v == "ok" for n, _, v, _ in results if n.startswith("PMC"))
+    pdf_ok = any(v == "ok" for _, k, v, _ in results if k == "pdf")
+
+    print(f"\n{Colors.BOLD}Diagnosis{Colors.RESET}")
+    if not meta_ok:
+        print(f"  {Colors.RED}✗ No metadata source reachable.{Colors.RESET} "
+              f"Nothing can work - check DNS / proxy / firewall first.")
+    if not pmc_ok:
+        print(f"  {Colors.RED}✗ PMC unreachable.{Colors.RESET} Phase B (the highest-yield route) "
+              f"will fail. Add --skip-pmc, or switch to a proxy node whose IP is not "
+              f"blacklisted by NCBI (TLS handshake is reset outright).")
+    if not pdf_ok:
+        print(f"  {Colors.YELLOW}! All publisher endpoints unreachable/blocked.{Colors.RESET} "
+              f"Typical of a datacenter proxy IP flagged by Cloudflare. Only repository "
+              f"mirrors (PMC / MDPI CDN / institutional repositories) will work.")
+    if meta_ok and pmc_ok and pdf_ok:
+        print(f"  {Colors.GREEN}✓ All channels healthy.{Colors.RESET}")
+    print()
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="OA-PDF-Download: Batch-download legally open-access PDF full texts."
@@ -530,11 +659,19 @@ def main():
     parser.add_argument("--email", default="", help="Contact email for Crossref polite pool")
     parser.add_argument("--skip-pmc", action="store_true", help="Skip Phase B (fast scan only)")
     parser.add_argument("--test", action="store_true", help="Run quick environment health check and exit 0")
+    parser.add_argument("--doctor", action="store_true",
+                        help="Probe every upstream channel (Crossref/Unpaywall/OpenAlex/Europe PMC/PMC/"
+                             "publishers) and explain what is blocking downloads")
     parser.add_argument("--no-color", action="store_true", help="Disable ANSI terminal colors")
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="Print every HTTP status code / content-type / size for each attempt")
     parser.add_argument("--no-xml-fallback", action="store_true",
                         help="Do not save Europe PMC JATS XML when no PDF is obtainable")
+    parser.add_argument("--force", action="store_true",
+                        help="Ignore existing state entries and re-download everything")
+    parser.add_argument("--filename", choices=["slug", "title"], default="slug",
+                        help="Output naming: 'slug' -> {year}_{slug}.pdf (default); "
+                             "'title' -> {full article title}.pdf")
     args = parser.parse_args()
 
     global VERBOSE
@@ -547,6 +684,10 @@ def main():
     if args.test:
         print("OA-PDF-Download: Health check PASSED.")
         print(f"Python: {sys.version.split()[0]} | HTTP Engine: {'requests' if HAS_REQUESTS else 'urllib (builtin)'}")
+        sys.exit(0)
+
+    if args.doctor:
+        run_doctor(args.email)
         sys.exit(0)
 
     # Resolve records from --doi or --input
@@ -579,7 +720,24 @@ def main():
 
     recs_map: Dict[str, PaperRecord] = {r.doi: r for r in records}
     total = len(recs_map)
-    todo = [d for d in recs_map if not state.get(d, {}).get("file")]
+
+    def already_done(doi: str) -> bool:
+        """A DOI counts as done only if the state says so AND the file still exists.
+
+        Records left behind by a deleted output directory used to be skipped
+        forever, which made "the PDF is gone, download it again" impossible
+        without hand-editing state.json.
+        """
+        entry = state.get(doi) or {}
+        fname = entry.get("file")
+        if not fname:
+            return False
+        return (outdir / fname).exists()
+
+    if args.force:
+        todo = list(recs_map)
+    else:
+        todo = [d for d in recs_map if not already_done(d)]
 
     print(f"\n{Colors.BOLD}{Colors.CYAN}{'='*60}{Colors.RESET}")
     print(f"{Colors.BOLD}{Colors.CYAN}  OA-PDF-Download: Harvester Pipeline Initialized{Colors.RESET}")
@@ -590,15 +748,30 @@ def main():
     log(f"Engine: {Colors.CYAN}{'requests' if HAS_REQUESTS else 'urllib (pure standard library)'}{Colors.RESET}")
     log(f"Output Directory: {outdir.resolve()}\n")
 
-    def store_pdf(doi: str, content: bytes, source: str):
-        rec = recs_map[doi]
-        year_str = rec.year or "nd"
-        slug_str = slugify(rec.title or doi)
-        filename = f"{year_str}_{slug_str}.pdf"
-        filepath = outdir / filename
+    def build_filename(doi: str, ext: str) -> str:
+        """Compose an output filename according to --filename.
 
-        filepath.write_bytes(content)
-        state[doi] = {"file": filename, "source": source}
+        ``title`` keeps the readable article title (word-boundary truncated),
+        which is what most people want when they browse the folder later.
+        """
+        rec = recs_map[doi]
+        if args.filename == "title":
+            stem = safe_title(rec.title or doi)
+        else:
+            stem = f"{rec.year or 'nd'}_{slugify(rec.title or doi)}"
+        filename = f"{stem}.{ext}"
+
+        # Two different DOIs can resolve to the same title (e.g. erratum + paper)
+        owner = next((d for d, e in state.items() if e.get("file") == filename), None)
+        if owner is not None and owner != doi:
+            suffix = doi.split("/")[-1].replace("/", "-")
+            filename = f"{stem} ({suffix}){'.' + ext}"
+        return filename
+
+    def store_pdf(doi: str, content: bytes, source: str):
+        filename = build_filename(doi, "pdf")
+        (outdir / filename).write_bytes(content)
+        state[doi] = {"file": filename, "source": source, "format": "pdf"}
         save_state(state_path, state)
 
         kb = len(content) // 1024
@@ -606,12 +779,8 @@ def main():
 
     def store_raw(doi: str, content: bytes, source: str, ext: str):
         """Save non-PDF fallback (e.g. JATS XML full text) without pretending it is a PDF."""
-        rec = recs_map[doi]
-        year_str = rec.year or "nd"
-        slug_str = slugify(rec.title or doi)
-        filename = f"{year_str}_{slug_str}.{ext}"
-        filepath = outdir / filename
-        filepath.write_bytes(content)
+        filename = build_filename(doi, ext)
+        (outdir / filename).write_bytes(content)
         state[doi] = {"file": filename, "source": source, "format": ext}
         save_state(state_path, state)
         kb = len(content) // 1024
@@ -685,25 +854,14 @@ def main():
         if downloaded:
             continue
 
-        # 4. Europe PMC JATS 全文 XML 兜底（PDF 拿不到时保留可读全文，如实标注格式）
+        # 4. Cache the PMCID now - Phase B (PMC PDF) and Phase C (XML fallback) both need it.
+        #    The JATS XML fallback is deliberately NOT executed here: saving XML in Phase A
+        #    marked the DOI as resolved and removed it from the queue, so Phase B never ran
+        #    and a perfectly downloadable PMC PDF was never attempted.
         if doi not in pmcids:
             pmcids[doi] = query_europe_pmc_pmcid(doi)
-        pmcid = pmcids.get(doi)
-        if pmcid and not args.no_xml_fallback:
-            xml_url = f"https://www.ebi.ac.uk/europepmc/webservices/rest/{pmcid}/fullTextXML"
-            res_xml = http_get(xml_url, timeout=40)
-            if VERBOSE:
-                print(
-                    f"      [verbose] epmc-xml: HTTP "
-                    f"{res_xml.status_code if res_xml else 'ERR'} "
-                    f"| {len(res_xml.content) if res_xml else 0}B"
-                )
-            if res_xml and res_xml.ok and res_xml.content[:5] == b"<?xml":
-                store_raw(doi, res_xml.content, "europepmc-fullTextXML", "xml")
-                todo.remove(doi)
-                continue
 
-        # 4. Semantic Scholar openAccessPdf Probe
+        # 5. Semantic Scholar openAccessPdf Probe
         res = http_get(
             f"https://api.semanticscholar.org/graph/v1/paper/DOI:{doi}",
             params={"fields": "openAccessPdf,isOpenAccess"},
@@ -738,11 +896,15 @@ def main():
         if pending_pmc:
             log(f"\n{Colors.BOLD}{Colors.MAGENTA}▶ Phase B: PMC Harvester with PoW Solver ({len(pending_pmc)} items){Colors.RESET}")
             round_num = 0
-            max_rounds = 2 if len(recs_map) <= 3 else 5  # Fast sandbox completion for small batches
+            max_rounds = 3 if len(recs_map) <= 3 else 5
+            cooldown = 60          # PMC rate-limit penalty; doubles on every blocked round
+            blocked = set()
+            unreachable = set()
 
             while pending_pmc and time.time() < deadline and round_num < max_rounds:
                 round_num += 1
                 unresolved = []
+                recaptcha_hit = False
                 for doi in pending_pmc:
                     if time.time() > deadline:
                         unresolved.append(doi)
@@ -763,32 +925,89 @@ def main():
                         unresolved.append(doi)
                         log(f"  {Colors.YELLOW}[-] Deferred ({note}):{Colors.RESET} {doi} ({pmcid})")
                         if note == "recaptcha":
-                            log(f"{Colors.RED}[!] reCAPTCHA detected. Cooling down...{Colors.RESET}")
-                            time.sleep(30)
+                            recaptcha_hit = True
+                            blocked.add(doi)
+                        elif note == "connect-err":
+                            unreachable.add(doi)
 
                 pending_pmc = unresolved
+                if pending_pmc and recaptcha_hit:
+                    remaining = int(deadline - time.time())
+                    wait = max(30, min(cooldown, remaining))
+                    log(f"{Colors.RED}[!] PMC is rate-limiting (reCAPTCHA). "
+                        f"Cooling down {wait}s before round {round_num + 1}...{Colors.RESET}")
+                    if remaining > 30:
+                        time.sleep(wait)
+                        cooldown = min(cooldown * 2, 240)
 
-            todo = [d for d in todo if not state.get(d, {}).get("file")]
+            if blocked:
+                log(f"{Colors.DIM}    Tip: {len(blocked)} paper(s) hit PMC's reCAPTCHA wall. "
+                    f"Re-run the same command in a few minutes - the challenge returns to normal "
+                    f"and PDFs download fine.{Colors.RESET}")
+            if unreachable:
+                log(f"{Colors.DIM}    Tip: PMC dropped the TLS connection for {len(unreachable)} paper(s) "
+                    f"(SSL UNEXPECTED_EOF, not a paywall). That is a network-path problem, not a "
+                    f"per-paper one: run `--doctor`, and try closing/switching your proxy - NCBI "
+                    f"resets handshakes from many proxy exits.{Colors.RESET}")
+
+            todo = [d for d in todo if not already_done(d)]
+
+    # ==========================================================================
+    # Phase C: Europe PMC JATS XML fallback (only for DOIs still without a PDF)
+    # ==========================================================================
+    # Deliberately runs AFTER Phase B. Saving the XML earlier used to remove the
+    # DOI from the queue, so the PMC PDF route was never given a chance.
+    if not args.no_xml_fallback:
+        pending_xml = [d for d in todo if not already_done(d)]
+        if pending_xml:
+            log(f"\n{Colors.BOLD}{Colors.YELLOW}▶ Phase C: Europe PMC JATS full-text fallback "
+                f"({len(pending_xml)} items){Colors.RESET}")
+        for doi in pending_xml:
+            if time.time() > deadline:
+                break
+            if doi not in pmcids:
+                pmcids[doi] = query_europe_pmc_pmcid(doi)
+            pmcid = pmcids.get(doi)
+            if not pmcid:
+                continue
+            xml_url = f"https://www.ebi.ac.uk/europepmc/webservices/rest/{pmcid}/fullTextXML"
+            res_xml = http_get(xml_url, timeout=40)
+            if VERBOSE:
+                print(
+                    f"      [verbose] epmc-xml: HTTP "
+                    f"{res_xml.status_code if res_xml else 'ERR'} "
+                    f"| {len(res_xml.content) if res_xml else 0}B"
+                )
+            if res_xml and res_xml.ok and res_xml.content[:5] == b"<?xml":
+                store_raw(doi, res_xml.content, "europepmc-fullTextXML", "xml")
+            time.sleep(0.3)
+        todo = [d for d in todo if not already_done(d)]
 
     # ==========================================================================
     # Summary Report & Manifest
     # ==========================================================================
-    success_dois = [d for d in recs_map if state.get(d, {}).get("file")]
+    success_dois = [d for d in recs_map if already_done(d)]
+    missing_dois = [d for d in recs_map if not already_done(d)]
     manifest_path = outdir / "_manifest.csv"
 
     try:
         with open(manifest_path, "w", newline="", encoding="utf-8-sig") as f:
             writer = csv.writer(f)
-            writer.writerow(["DOI", "Title", "Year", "Filename", "Source"])
+            writer.writerow(["DOI", "Title", "Year", "Format", "Size", "Filename", "Source", "Status"])
             for d, rec in recs_map.items():
                 st = state.get(d, {})
-                writer.writerow([
-                    d,
-                    rec.title,
-                    rec.year,
-                    st.get("file", ""),
-                    st.get("source", "Not Available via OA"),
-                ])
+                fname = st.get("file", "")
+                path = outdir / fname if fname else None
+                if path is not None and path.exists():
+                    fmt = "PDF" if path.suffix.lower() == ".pdf" else path.suffix.lstrip(".").upper()
+                    size = (f"{path.stat().st_size / 1048576:.2f} MB" if fmt == "PDF"
+                            else f"{path.stat().st_size // 1024} KB")
+                    status = "obtained"
+                else:
+                    fmt = size = ""
+                    status = "missing (file deleted or not obtained)"
+                writer.writerow([d, rec.title, rec.year, fmt, size, fname,
+                                 st.get("source", "Not Available via OA"), status])
     except Exception:
         pass
 
@@ -812,9 +1031,9 @@ def main():
     log(f"Any full text: {Colors.BOLD}{len(success_dois)}/{total} "
         f"({(len(success_dois)/total*100):.1f}%){Colors.RESET}")
 
-    if todo:
-        log(f"\n{Colors.YELLOW}Unobtained / Paywalled Papers ({len(todo)}):{Colors.RESET}")
-        for d in todo:
+    if missing_dois:
+        log(f"\n{Colors.YELLOW}Unobtained / Paywalled Papers ({len(missing_dois)}):{Colors.RESET}")
+        for d in missing_dois:
             log(f"  {Colors.RED}✗{Colors.RESET} {d} - {Colors.DIM}{recs_map[d].title[:60]}{Colors.RESET}")
 
     log(f"\nManifest saved to: {Colors.CYAN}{manifest_path.resolve()}{Colors.RESET}")

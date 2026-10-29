@@ -5,7 +5,7 @@ display_name_en: OA PDF Downloader
 description: 批量合法合规下载开放获取(Open Access)学术论文PDF全文。支持根据单个DOI、多个DOI或文献表格(CSV/TXT)一键获取，自动适配PMC、Springer、MDPI、Frontiers等渠道。
 description_zh: 批量合法合规下载开放获取(Open Access)学术论文PDF全文，内置PMC PoW挑战求解器，支持主流学术出版商直链与断点续传。
 description_en: Batch-download legally open-access (OA) academic full-text PDFs with built-in PMC Hashcash PoW solver, multi-publisher routing, and crash-safe state persistence.
-version: 1.2.1
+version: 1.3.0
 author: "JL666788"
 allowed-tools: bash
 examples_zh:
@@ -25,6 +25,7 @@ examples_en:
 
 - 出版商直链解析规则参见：@references/publisher-routes.md
 - PMC PoW 算法与反爬对抗纪律参见：@references/anti-bot-and-network.md
+- 症状→原因→处置速查表与真实案例复盘参见：@TROUBLESHOOTING.md
 
 ---
 
@@ -70,6 +71,24 @@ python scripts/fetch_oa_pdfs.py --input "records.csv" --outdir "PDFs" --state "s
 python scripts/fetch_oa_pdfs.py --test
 ```
 
+#### 场景 4：下载失败 / 全部返回 403 / 一律 connect-err —— 先做体检
+```bash
+python scripts/fetch_oa_pdfs.py --doctor --email "你的真实邮箱"
+```
+逐项输出 Crossref / Unpaywall / OpenAlex / Europe PMC / PMC / MDPI CDN / Wiley / Cell Press
+的 `ok` / `blocked` / `throttled` / `unreachable` 与诊断结论。**在向用户解释"为什么下不下来"之前，先跑这一步**，它能区分「网络被封」与「文章本身没有 OA」。
+
+#### 场景 5：需要按文章标题命名文件
+```bash
+python scripts/fetch_oa_pdfs.py --doi "10.xxxx/yyy" --filename title
+```
+
+#### 场景 6：目录里的 PDF 被删了，但 state.json 还记着"已完成"
+```bash
+python scripts/fetch_oa_pdfs.py --input records.csv --force
+```
+脚本本身也会校验文件是否真实存在（不存在即视为待下载），`--force` 则是无视记录全部重下。
+
 ---
 
 ### 第二步：观察控制台输出与执行状态
@@ -77,10 +96,12 @@ python scripts/fetch_oa_pdfs.py --test
 脚本执行时会自动：
 1. **Phase A（秒级快筛）**：优先请求 Springer / BMC / Frontiers / **MDPI 自有 CDN（mdpi-res.com，绕 WAF）** / J-Stage 等出版商直链。
 2. **OA 全量定位**：并发查 **Unpaywall → OpenAlex**，这两个 API 不在出版商 WAF 之后，能拿到被主站拦截的 PDF 直链。
-3. **Phase B（PMC 深度突破）**：对有 PMCID 的文献求解 Hashcash PoW 挑战（若本机 NCBI 不可达，请加 `--skip-pmc`）。
-4. **全文兜底**：PDF 全部失败时降级保存 Europe PMC JATS 全文 `.xml`，并明确标注格式，**不冒充 PDF**（可用 `--no-xml-fallback` 关闭）。
+3. **Phase B（PMC 深度突破）**：对有 PMCID 的文献求解 Hashcash PoW；对 `SSL UNEXPECTED_EOF` 这类瞬时断连内置 3 次重试；遇 reCAPTCHA 风控则 60s→120s→240s 逐轮退避（冷却后会恢复为可解的 PoW 页）。
+4. **Phase C（全文兜底）**：**仅在前两步全部失败后**才降级保存 Europe PMC JATS 全文 `.xml` 并明确标注格式，**不冒充 PDF**（可用 `--no-xml-fallback` 关闭）。
 5. **安全落盘**：每成功下载一篇即原子落盘保存，并更新 `state.json`。
-6. **生成清单**：在输出目录生成 `_manifest.csv`，摘要中分别统计「PDF obtained / XML only / Any full text」。
+6. **生成清单**：输出目录生成 `_manifest.csv`（DOI/Title/Year/Format/Size/Filename/Source/Status），摘要分别统计「PDF obtained / XML only / Any full text」。
+
+> ⚠️ **顺序很关键**：XML 兜底必须排在 PMC 之后。此前版本在 Phase A 写 XML 并移除 DOI，导致 PMC 阶段从未执行——能从 PMC 秒下的 PDF 只剩一个 XML。
 
 > 💡 **排障要点**：若多个不同出版商同时返回 403，是**出口 IP 信誉**问题（非代理未生效）。用 `--verbose` 逐渠道查看状态码，然后更换出口节点，不要反复重试。
 

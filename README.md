@@ -36,21 +36,28 @@
   - **绝不绕过付费墙，不连接 Sci-Hub**，不使用任何未授权 Cookie。未开放获取的文献将如实标明，便于通过高校机构校园网购买权限检索。
 - 🧩 **独家 PMC Hashcash Proof-of-Work (PoW) 自动应答**
   - 针对 `pmc.ncbi.nlm.nih.gov` 设置的浏览器防爬 Hashcash 挑战（4 难度 SHA-256 碰撞），内置纯 Python 高速算力求解器，自动生成 `cloudpmc-viewer-pow` 验证通行证。
-- ⚡ **双阶段智能调度管道 (Two-Phase Pipeline)**
-  - **Phase A (快筛阶段)**：秒级扫描 Springer, BMC, Frontiers, MDPI, J-Stage，再叠加 **Unpaywall → OpenAlex** 全量 OA 定位，最后以 Semantic Scholar 与 Europe PMC JATS 全文兜底。
-  - **Phase B (精打阶段)**：多轮随机间隔（15–30s）退避调度 PMC，智能监测 reCAPTCHA 升级风险并自动触发 90s+ 冷却机制。
+  - **瞬时断连自动重试**：PMC 常在第一次请求时用 `SSL: UNEXPECTED_EOF_WHILE_READING` 掐断连接，第二次就正常返回。脚本对这类抖动内置 3 次递增重试，不再把「抖了一下」误判成「下不到」。
+- ⚡ **三阶段智能调度管道 (Phase A / B / C)**
+  - **Phase A (快筛阶段)**：秒级扫描 Springer, BMC, Frontiers, MDPI-CDN, J-Stage，再叠加 **Unpaywall → OpenAlex** 全量 OA 定位，最后以 Semantic Scholar 兜底。**此阶段只找 PDF，不写 XML。**
+  - **Phase B (精打阶段)**：多轮随机间隔退避调度 PMC，自动求解 PoW；识别 reCAPTCHA 风控并按 60s → 120s → 240s 逐轮退避冷却（冷却后挑战会恢复为 PoW，可继续）。
+  - **Phase C (兜底阶段)**：仅对前述全部失败、且确有 PMCID 的条目，降级保存 Europe PMC JATS 全文并标注格式。**刻意排在 PMC 之后**——早期版本在 Phase A 就写 XML，会把 DOI 从队列移除，使 PMC 阶段永远不执行。
+- 🩺 **`--doctor` 环境体检**
+  - 一次性探测 Crossref / Unpaywall / OpenAlex / Europe PMC / PMC / MDPI CDN / Wiley / Cell Press，逐项给出 `ok` / `blocked` / `throttled` / `unreachable` 与结论。
+  - 直接回答「是网络被封，还是这篇文章本来就没有 OA」，比盯着 `0/N` 猜快得多。
 - 🔗 **出版商自有 CDN 优先策略**
   - MDPI 等平台的主站常挂在 Akamai / Cloudflare 之后，机房或代理 IP 极易被判 403；脚本优先走其自有静态 CDN（如 `mdpi-res.com`），**绕过 WAF 边缘拦截**，实测同一篇论文主站 403、CDN 却是 200 / 21 MB 正常 PDF。
 - 🇨🇳 **深度适配国内学术网络环境**
   - 彻底规避 `www.ncbi.nlm.nih.gov` 在国内部分网络下的 DNS 污染异常，重定向至高可用的 `pmc.ncbi.nlm.nih.gov` 与 Europe PMC API。
   - 优雅处理 Cloudflare 403 阻断，自动降级至稳定仓储镜像。
+  - `--verbose` 会打印**完整的 SSL 异常原文**，让 `connect-err` 从黑箱变成可判断（是对端重置、超时还是 DNS）。
 - 💾 **事务级断点续传 (Crash-Safe)**
   - 采用原子状态文件 `state.json`，每下载成功一篇立即安全落盘。
-  - 支持随时中断（Ctrl+C 或超时杀进程），重新启动无缝跳过已完成项目，避免重复请求。
+  - 随时中断（Ctrl+C 或超时杀进程）后重新启动可无缝跳过已完成项目。
+  - **同时校验文件是否真实存在**：文件被删掉后不会因为 state 里还留着记录就永久跳过；`--force` 可无视记录全部重下。
 - 📑 **学术归档级命名与 Manifest 报告**
-  - 输出文件严格规整命名为 `{年份}_{标题-slug}.pdf`，方便按年份和论文题名索引检索。
+  - `--filename title` 直接以**完整文章标题**命名（去 JATS 内联标签、转义 HTML 实体、替换 Windows 非法字符，并在**词边界**截断，不会切出 `...inflammato` 这种断词）；默认 `slug` 为 `{年份}_{短标题}.pdf`。
   - 自动校验 `%PDF` 文件魔数与体积阈值（>15KB），坚决杜绝把 HTML 拦截页误存为 PDF。
-  - 自动生成 `_manifest.csv` 映射清单与控制台分类统计报表。
+  - `_manifest.csv` 含 `DOI / Title / Year / Format / Size / Filename / Source / Status` 八列，能直接看出每篇的格式、来源，以及「文件已不在本地」这类状态。
 
 ---
 
@@ -58,38 +65,45 @@
 
 ```mermaid
 flowchart TD
-    Start(["📥 输入 DOI 列表 / CSV / TXT"]) --> LoadState["🔍 检查 state.json 断点续传"]
+    Start(["📥 输入 DOI 列表 / CSV / TXT / --doi"]) --> Doctor{"--doctor 体检?"}
+    Doctor -- "是" --> Diag["🩺 逐个探测上游通道并给出诊断"] --> End
+    Doctor -- "否" --> LoadState["🔍 检查 state.json（并校验文件真实存在）"]
     LoadState --> PhaseA["⚡ Phase A: 快速直链嗅探 (~0.5s)"]
-    
-    subgraph PhaseA_Detail ["Phase A 渠道快筛"]
+
+    subgraph PhaseA_Detail ["Phase A 渠道快筛（只找 PDF，不写 XML）"]
         PA1["Crossref 元数据解析"] --> PA2["出版商直接规则 (Springer / BMC / Frontiers / MDPI-CDN / J-Stage)"]
         PA2 --> PA3["Unpaywall → OpenAlex 全量 OA 定位"]
-        PA3 --> PA4["Europe PMC fullTextXML / Semantic Scholar 兜底"]
-        PA4 --> PA5["无 PDF 时降级保存 JATS XML（如实标注格式）"]
+        PA3 --> PA4["Semantic Scholar openAccessPdf 兜底"]
     end
     PhaseA --> PhaseA_Detail
     PhaseA_Detail --> CheckA{"是否成功获取?"}
-    
+
     CheckA -- "是 (验证 %PDF > 15KB)" --> SavePDF["💾 保存 PDF 并更新 state.json"]
     CheckA -- "否" --> CheckPMC{"是否存在 PMCID?"}
-    
-    CheckPMC -- "有 PMCID" --> PhaseB["🐢 Phase B: PMC PoW 自适应调度 (15~30s)"]
-    CheckPMC -- "无 PMCID" --> FailList["❌ 记录为无合法 OA 路由 (如商业付费墙)"]
-    
-    subgraph PhaseB_Detail ["Phase B PMC 突破"]
-        PB1["GET pmc.ncbi.nlm.nih.gov"] --> PB2{"响应类型?"}
+
+    CheckPMC -- "有 PMCID" --> PhaseB["🐢 Phase B: PMC PoW 自适应调度"]
+    CheckPMC -- "无 PMCID" --> PhaseC
+
+    subgraph PhaseB_Detail ["Phase B PMC 突破（内置 3 次瞬时重试）"]
+        PB1["GET pmc.ncbi.nlm.nih.gov/articles/{PMCID}/pdf/"] --> PB2{"响应类型?"}
         PB2 -- "直接返回 PDF" --> SavePDF
         PB2 -- "POW_CHALLENGE 挑战" --> PB3["🧩 求解 Hashcash SHA-256 Nonce"]
-        PB3 --> PB4["携带 cloudpmc Cookie 重放请求"]
+        PB3 --> PB4["携带 cloudpmc-viewer-pow Cookie 重放"]
         PB4 --> PB2
-        PB2 -- "reCAPTCHA 升级" --> PB5["⏳ 冷却 90s+，下轮重试"]
+        PB2 -- "reCAPTCHA 风控" --> PB5["⏳ 60s→120s→240s 逐轮退避冷却"]
+        PB2 -- "SSL 断连 (connect-err)" --> PB6["🔁 立即重试 3 次（多为瞬时抖动）"]
     end
     PhaseB --> PhaseB_Detail
-    
-    SavePDF --> Manifest["📊 导出 _manifest.csv & 生成终结摘要"]
-    FailList --> Manifest
+
+    PhaseB_Detail --> PhaseC["📄 Phase C: Europe PMC JATS 全文兜底（仅对仍无 PDF 的条目）"]
+    PhaseC --> SaveXML["💾 存为 .xml 并如实标注「非 PDF」"]
+
+    SavePDF --> Manifest["📊 导出 _manifest.csv（含 Format / Size / Status）"]
+    SaveXML --> Manifest
     Manifest --> End(["🎉 完成交付"])
 ```
+
+> **关键顺序**：XML 兜底被刻意放在 **Phase C**，即 PMC 之后。早期版本在 Phase A 就写 XML 并移除该 DOI，导致 PMC 阶段不再执行——能从 PMC 正常下到 PDF 的文献只剩一个 XML。
 
 ---
 
@@ -223,16 +237,26 @@ State file saved to: /workspace/state.json
 
 | 参数项 | 简写 | 必填 | 默认值 | 详细说明 |
 |:---|:---:|:---:|:---:|:---|
-| `--input` | `-i` | **是** | - | 输入文件路径（支持 CSV 或 TXT） |
-| `--outdir` | `-o` | **是** | - | PDF 全文保存的输出目录 |
+| `--doi` | - | 二选一 | - | 直接在命令行给出一个或多个 DOI，无需准备文件 |
+| `--input` | `-i` | 二选一 | - | 输入文件路径（支持 CSV 或 TXT） |
+| `--outdir` | `-o` | 否 | `PDFs` | PDF 全文保存的输出目录 |
 | `--state` | `-s` | 否 | `state.json` | 进度状态记录 JSON，支持断点续传 |
-| `--deadline-min` | - | 否 | `45` | 任务总截止时间（分钟），避免后台无限阻塞 |
-| `--pmc-delay` | - | 否 | `15.0 30.0` | PMC 抓取时的最小/最大随机间隔秒数（防反爬） |
-| `--email` | - | 否 | `""` | 真实联系邮箱，用于触发 Crossref Polite 优待池 |
+| `--deadline-min` | - | 否 | `30` | 任务总截止时间（分钟），避免后台无限阻塞 |
+| `--pmc-delay` | - | 否 | `10 20` | PMC 抓取时的最小/最大随机间隔秒数（防反爬） |
+| `--email` | - | 否 | `""` | 真实联系邮箱，用于触发 Crossref / Unpaywall 优待池 |
 | `--skip-pmc` | - | 否 | `False` | 跳过 Phase B（仅执行 Phase A 快速扫描） |
-| `--verbose` | `-v` | 否 | `False` | 输出更详细的网络探测与 HTTP 调试信息 |
+| `--verbose` | `-v` | 否 | `False` | 输出更详细的网络探测与 HTTP 调试信息（含 SSL 错误原文） |
 | `--no-xml-fallback` | - | 否 | `False` | 禁止在拿不到 PDF 时降级保存 Europe PMC JATS 全文 XML |
+| `--force` | - | 否 | `False` | 忽略 state.json 的已完成记录，强制重新下载 |
+| `--filename` | - | 否 | `slug` | 命名策略：`slug` → `{年份}_{短标题}.pdf`；`title` → `{完整文章标题}.pdf` |
+| `--doctor` | - | 否 | `False` | 体检模式：逐个探测各上游通道并给出诊断结论，不下载任何文件 |
 | `--no-color` | - | 否 | `False` | 禁用终端 ANSI 彩色转义序列 |
+
+> **出问题先跑体检**：`python scripts/fetch_oa_pdfs.py --doctor --email you@example.com`。
+> 它会把 Crossref / Unpaywall / OpenAlex / Europe PMC / PMC / MDPI CDN / 各出版商逐个探测一遍，
+> 直接告诉你「是网络被封还是文章本身没有 OA」，比盯着 `0/N` 猜要快得多。
+>
+> 完整排障清单见 **[TROUBLESHOOTING.md](TROUBLESHOOTING.md)**（含症状→原因→处置速查表与真实案例复盘）。
 
 ---
 
@@ -256,6 +280,8 @@ State file saved to: /workspace/state.json
 工具内部已主动回避了受污染的 <code>www.ncbi.nlm.nih.gov</code>，转而采用 <code>pmc.ncbi.nlm.nih.gov</code> 以及欧洲生物信息研究所的 Europe PMC 镜像。如果您的局域网环境对境外学术服务器限制较严格，可配置标准环境变量代理：
 <pre><code>export HTTP_PROXY="http://127.0.0.1:7890"
 export HTTPS_PROXY="http://127.0.0.1:7890"</code></pre>
+<br>
+但实测有一反直觉现象值得知道：<b>对 NCBI 而言，挂代理不一定更好，反而可能更差</b>。同一台机器上曾出现「代理全开时 PMC 一直握手失败，关掉代理用国内宽带直连反而 200」。原因是 NCBI 会对大量机场/机房出口节点直接重置 TLS 握手，与节点速度快慢无关。若 PMC 反复失败，先试<b>关掉代理直连</b>，再试换节点，不要默认「一定是没挂代理」。
 </details>
 
 <details>
@@ -267,15 +293,64 @@ export HTTPS_PROXY="http://127.0.0.1:7890"</code></pre>
 <li>MDPI 主站 → <b>403 Access Denied</b>（但自有 CDN <code>mdpi-res.com</code> 仍可 200）；</li>
 <li>NCBI 全部子域（<code>pmc</code> / <code>www</code> / <code>eutils</code> / <code>ftp</code>）→ TLS 握手直接被断开。</li>
 </ul>
-排查方法：先用 <code>--verbose</code> 看每个渠道的状态码。若多个不同出版商同时 403，基本可判定为 IP 被封，请<b>更换出口节点</b>（优先住宅 IP 或换一家机场），而非反复重试。
+排查方法：先跑 <code>--doctor</code>，若多个不同出版商同时 403，基本可判定为 IP 被封，请<b>更换出口节点</b>（优先住宅 IP 或换一家机场），而非反复重试。
 <br><br>
 另外注意：使用 TUN 模式（如 FlClash 的 <code>global</code> + TUN）时，<b>所有流量都被系统级接管</b>，此时 <code>curl --noproxy</code> 与 <code>-x 127.0.0.1:7890</code> 的出口 IP 必然相同——不能据此判断「代理没生效」。
+<br><br>
+补充：<b>Cloudflare 的「Just a moment…」是 JS 托管挑战</b>，用 TLS 指纹模拟（如 <code>curl_cffi</code> 的 <code>impersonate="chrome"</code>）和无头 Chrome 都过不去，因为拦你的是需要执行 JS 的那一步。这类站点只能靠<b>真实浏览器</b>手动点击。
 </details>
 
 <details>
 <summary><b>Q5: 为什么有时保存的是 .xml 而不是 .pdf？</b></summary>
 <br>
-当所有合法 PDF 通道都不可用时，脚本会降级保存 Europe PMC 的 JATS 全文 XML（含完整正文与参考文献），<b>文件名后缀为 <code>.xml</code> 并明确标注「全文XML非PDF」</b>，绝不会把 XML 或 HTML 拦截页冒充成 PDF。若不需要此兜底行为，加 <code>--no-xml-fallback</code>。
+当所有合法 PDF 通道都不可用时，脚本会在<b>最后的 Phase C</b> 降级保存 Europe PMC 的 JATS 全文 XML（含完整正文与参考文献），<b>文件名后缀为 <code>.xml</code> 并明确标注「全文XML非PDF」</b>，绝不会把 XML 或 HTML 拦截页冒充成 PDF。若不需要此兜底行为，加 <code>--no-xml-fallback</code>。
+<br><br>
+<b>注意这个保底是刻意排在 PMC 之后的</b>：早期版本在 Phase A 就写 XML 并把该 DOI 从队列移除，导致 Phase B 的 PMC PDF 阶段根本没机会执行——明明从 PMC 一秒就能下到 PDF，却只留下一个 XML。如果你只要 PDF，请<b>不要</b>用 <code>--no-xml-fallback</code> 来"加速"，它的作用只是不写兜底文件，不改变通道顺序。
+</details>
+
+<details>
+<summary><b>Q6: 日志里满屏 <code>connect-err</code> / <code>SSL UNEXPECTED_EOF_WHILE_READING</code> 是什么意思？</b></summary>
+<br>
+这是 <b>TLS 连接被对端主动掐断</b>，不是文章没有全文、也不是代码解析失败。判据很简单：同一篇文章、同一个 PMCID，换个网络就能下下来。
+<ul>
+<li>脚本对这类错误<b>会自动重试 3 次</b>（间隔递增），因为 PMC 的第一跳经常抖一下就断，第二次就正常；</li>
+<li>加 <code>--verbose</code> 可以看到完整的 SSL 错误原文，而不是只有一句 <code>connect-err</code>；</li>
+<li>连续多篇都这样，说明是<b>网络路径问题</b>，跑 <code>--doctor</code> 确认 PMC 那一行是不是 <code>unreachable</code>。</li>
+</ul>
+</details>
+
+<details>
+<summary><b>Q7: PMC 提示 <code>reCAPTCHA</code> / 出现「Checking your browser」怎么办？</b></summary>
+<br>
+说明请求频率把 PMC 的爬虫风控触发了。此时 <code>/pdf/</code> 返回的不再是 PoW 挑战页，而是一个约 20 KB 的 reCAPTCHA 拦截页。
+<ul>
+<li><b>不要连续重试</b>，越试锁得越久；脚本会按 60s → 120s → 240s 逐轮退避冷却；</li>
+<li>冷却结束后会<b>自动恢复成 PoW 挑战页</b>，此时可正常求解并下载；</li>
+<li>单篇实测比批量更容易过，批量时把 <code>--pmc-delay</code> 调大（如 <code>20 40</code>）更稳。</li>
+</ul>
+</details>
+
+<details>
+<summary><b>Q8: state.json 显示已完成，但目录里的 PDF 不见了，怎么重下？</b></summary>
+<br>
+旧版本只看 state 里的记录就跳过，文件被删了也不会重下。现在脚本会<b>同时校验文件是否真的存在</b>，不存在则视为待下载、自动重取。若想无视记录全部重来，加 <code>--force</code>。
+</details>
+
+<details>
+<summary><b>Q9: 能否用文章标题（而不是「年份_短标题」）命名文件？</b></summary>
+<br>
+可以，加 <code>--filename title</code>。标题会做安全处理：去掉 JATS 内联标签（<code>&lt;scp&gt;</code>、<code>&lt;i&gt;</code> 等）、转义 HTML 实体、替换 Windows 非法字符，并在<b>词边界</b>截断——早期版本按字符硬切，会产生 <code>...specific inflammato</code> 这种断词的文件名。
+</details>
+
+<details>
+<summary><b>Q10: 哪类文献注定拿不到？</b></summary>
+<br>
+<ul>
+<li><b>bronze OA（如 Cell Press 部分文章）</b>：OpenAlex 标 <code>is_oa=true</code>，但 <code>any_repository_has_fulltext=false</code>，唯一来源是出版商站点且被 Cloudflare 拦住 → 只能人工用浏览器打开点击下载；</li>
+<li><b>纯订阅文献且无绿色 OA 副本</b>（无 PMCID、无机构库存档）→ 任何合法工具都拿不到；</li>
+<li><b>PMC 里只有免费 HTML、不提供 PDF 的条目</b>（<code>isOpenAccess=N</code>）→ 只能读 HTML，没有 PDF 可下。</li>
+</ul>
+用 <code>--doctor</code> 先分清是「网络拿不到」还是「本来就没有」，避免白折腾。
 </details>
 
 ---
